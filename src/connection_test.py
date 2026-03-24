@@ -146,6 +146,49 @@ def test_google_drive_connection() -> bool:
         files = results.get("files", [])
         log.info(f"  PASS — Drive API read: {len(files)} file(s) visible to service account.")
 
+        # --- Step A2: Check storage quota ---
+        about = drive_service.about().get(fields="storageQuota").execute()
+        quota = about.get("storageQuota", {})
+        used = int(quota.get("usageInDrive", 0)) + int(quota.get("usageInDriveTrash", 0))
+        limit = int(quota.get("limit", 0))
+        used_mb = used / (1024 * 1024)
+        limit_mb = limit / (1024 * 1024) if limit else 0
+        log.info(f"  INFO — Storage: {used_mb:.1f} MB used" + (f" / {limit_mb:.0f} MB limit" if limit else " (no limit reported)"))
+        trash_bytes = int(quota.get("usageInDriveTrash", 0))
+        if trash_bytes > 0:
+            log.info(f"  INFO — {trash_bytes / (1024*1024):.1f} MB in trash.")
+
+        # --- Step A3: Clean up — delete ALL files owned by this SA to free quota ---
+        page_token = None
+        deleted_count = 0
+        while True:
+            resp = drive_service.files().list(
+                pageSize=100,
+                fields="nextPageToken, files(id, name)",
+                pageToken=page_token,
+            ).execute()
+            batch_files = resp.get("files", [])
+            if not batch_files:
+                break
+            for f in batch_files:
+                try:
+                    drive_service.files().delete(fileId=f["id"]).execute()
+                    deleted_count += 1
+                except HttpError:
+                    pass
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        if deleted_count:
+            log.info(f"  INFO — Deleted {deleted_count} old file(s) to free storage.")
+
+        # Empty trash to actually reclaim quota
+        try:
+            drive_service.files().emptyTrash().execute()
+            log.info("  INFO — Emptied Drive trash.")
+        except HttpError:
+            log.warning("  WARN — Could not empty trash.")
+
         # --- Step B: Drive API — create and delete a temp file (write test) ---
         test_file = None
         try:
@@ -156,7 +199,12 @@ def test_google_drive_connection() -> bool:
             log.info(f"  PASS — Drive API write: created test doc (id={test_file['id']}).")
         except HttpError as e:
             log.error(f"  FAIL — Drive API write: cannot create files: {e}")
-            log.error("         Check: Google Drive API enabled? Service account has Editor/Owner role?")
+            if "storageQuotaExceeded" in str(e):
+                log.error("         Storage is STILL full after cleanup. The SA may share quota")
+                log.error("         with a personal Google account. Free space in that account,")
+                log.error("         or create a new SA in a different GCP project.")
+            else:
+                log.error("         Check: Google Drive API enabled? Service account has Editor/Owner role?")
             return False
         finally:
             # Always clean up the temp file

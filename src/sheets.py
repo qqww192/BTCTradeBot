@@ -73,6 +73,32 @@ def _empty_trash(drive_service) -> None:
         log.warning("Failed to empty Drive trash: %s", e)
 
 
+def _reclaim_storage(drive_service, keep_ids: set[str] | None = None) -> None:
+    """Delete all SA-owned files except those in keep_ids, then empty trash."""
+    keep_ids = keep_ids or set()
+    page_token = None
+    deleted = 0
+    while True:
+        resp = drive_service.files().list(
+            pageSize=100,
+            fields="nextPageToken, files(id, name)",
+            pageToken=page_token,
+        ).execute()
+        for f in resp.get("files", []):
+            if f["id"] not in keep_ids:
+                try:
+                    drive_service.files().delete(fileId=f["id"]).execute()
+                    deleted += 1
+                except HttpError:
+                    pass
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    if deleted:
+        log.info("Deleted %d old file(s) to free storage.", deleted)
+    _empty_trash(drive_service)
+
+
 def _find_existing_sheet(drive_service) -> Optional[str]:
     """Search for an existing T212 Portfolio Tracker sheet."""
     try:
@@ -120,8 +146,9 @@ def _get_or_create_sheet(sheets_service, drive_service) -> str:
         spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
     except HttpError as exc:
         if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
-            log.warning("Storage quota exceeded — emptying trash and retrying.")
-            _empty_trash(drive_service)
+            log.warning("Storage quota exceeded — deleting old files and retrying.")
+            keep = {SHEET_ID} if SHEET_ID else set()
+            _reclaim_storage(drive_service, keep_ids=keep)
             spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
         else:
             raise
