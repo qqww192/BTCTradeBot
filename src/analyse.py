@@ -75,5 +75,13 @@ def analyse_portfolio(positions: list[dict[str, Any]], run_date: str) -> str:
     response = client.models.generate_content(model=MODEL, contents=prompt)
 
     report = response.text
+    if not report:
+        # Log full response for debugging, then raise a clear error
+        log.error("Gemini returned no text. Full response: %s", response)
+        raise RuntimeError(
+            "Gemini returned an empty response. This can happen when the "
+            "response is blocked by safety filters or the model produces no "
+            "text output. Check the logs above for the full API response."
+        )
     log.info(f"Gemini analysis complete — {len(report)} chars.")
     return report
