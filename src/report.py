@@ -60,20 +60,20 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
         return MASTER_DOC_ID
 
     log.info("GOOGLE_DOC_ID not set — creating a new master document.")
-    body = {"title": "T212 Portfolio Reports"}
 
-    # Create the doc
-    doc = docs_service.documents().create(body=body).execute()
-    doc_id: str = doc["documentId"]
-
-    # Move to folder if specified
+    # Create the doc via Drive API (more permissive than Docs API create)
+    file_metadata = {
+        "name": "T212 Portfolio Reports",
+        "mimeType": "application/vnd.google-apps.document",
+    }
     if REPORT_FOLDER_ID:
-        drive_service.files().update(
-            fileId=doc_id,
-            addParents=REPORT_FOLDER_ID,
-            removeParents="root",
-            fields="id, parents",
-        ).execute()
+        file_metadata["parents"] = [REPORT_FOLDER_ID]
+
+    file = drive_service.files().create(
+        body=file_metadata,
+        fields="id",
+    ).execute()
+    doc_id: str = file["id"]
 
     log.info(
         f"\n{'='*60}\n"
