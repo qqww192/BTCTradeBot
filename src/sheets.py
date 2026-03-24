@@ -131,40 +131,61 @@ def _get_or_create_sheet(sheets_service, drive_service) -> str:
         log.info("Found existing sheet %s — reusing.", existing)
         return existing
 
-    # 3. Create new spreadsheet with three tabs
+    # 3. Create new spreadsheet
     log.info("Creating new T212 Portfolio Tracker spreadsheet.")
-    body = {
-        "properties": {"title": "T212 Portfolio Tracker"},
-        "sheets": [
-            {"properties": {"title": TAB_PORTFOLIO}},
-            {"properties": {"title": TAB_WATCHLIST}},
-            {"properties": {"title": TAB_MARKET}},
-        ],
-    }
 
-    try:
-        spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
-    except HttpError as exc:
-        if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
-            log.warning("Storage quota exceeded — deleting old files and retrying.")
-            keep = {SHEET_ID} if SHEET_ID else set()
-            _reclaim_storage(drive_service, keep_ids=keep)
-            spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
-        else:
-            raise
-
-    sheet_id = spreadsheet["spreadsheetId"]
-
-    # Move to folder if configured
     if REPORT_FOLDER_ID:
+        # Create via Drive API directly in the user's folder — avoids SA quota limits
+        log.info("Creating spreadsheet in shared folder %s (uses folder owner's quota).", REPORT_FOLDER_ID)
+        file_metadata = {
+            "name": "T212 Portfolio Tracker",
+            "mimeType": "application/vnd.google-apps.spreadsheet",
+            "parents": [REPORT_FOLDER_ID],
+        }
+        file = drive_service.files().create(body=file_metadata, fields="id").execute()
+        sheet_id = file["id"]
+
+        # Add the three tabs (Drive API only creates a default Sheet1)
+        # Rename Sheet1 → Portfolio, then add Watchlist and Market Overview
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        default_sheet_id = spreadsheet["sheets"][0]["properties"]["sheetId"]
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"requests": [
+                {"updateSheetProperties": {
+                    "properties": {"sheetId": default_sheet_id, "title": TAB_PORTFOLIO},
+                    "fields": "title",
+                }},
+                {"addSheet": {"properties": {"title": TAB_WATCHLIST}}},
+                {"addSheet": {"properties": {"title": TAB_MARKET}}},
+            ]},
+        ).execute()
+    else:
+        # No folder configured — create in SA's own Drive via Sheets API
+        log.warning(
+            "GOOGLE_DRIVE_FOLDER_ID not set. Creating in service account's Drive. "
+            "This may fail if the SA has no storage quota. "
+            "Set GOOGLE_DRIVE_FOLDER_ID to a folder shared with the SA."
+        )
+        body = {
+            "properties": {"title": "T212 Portfolio Tracker"},
+            "sheets": [
+                {"properties": {"title": TAB_PORTFOLIO}},
+                {"properties": {"title": TAB_WATCHLIST}},
+                {"properties": {"title": TAB_MARKET}},
+            ],
+        }
         try:
-            drive_service.files().update(
-                fileId=sheet_id,
-                addParents=REPORT_FOLDER_ID,
-                fields="id, parents",
-            ).execute()
-        except HttpError as e:
-            log.warning("Could not move sheet to folder %s: %s", REPORT_FOLDER_ID, e)
+            spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
+        except HttpError as exc:
+            if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
+                log.warning("Storage quota exceeded — deleting old files and retrying.")
+                keep = {SHEET_ID} if SHEET_ID else set()
+                _reclaim_storage(drive_service, keep_ids=keep)
+                spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
+            else:
+                raise
+        sheet_id = spreadsheet["spreadsheetId"]
 
     # Write headers
     sheets_service.spreadsheets().values().batchUpdate(

@@ -150,27 +150,23 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
 
     log.info("No existing report doc found — creating a new master document.")
 
-    # Create the doc via Drive API (more permissive than Docs API create)
+    # Create the doc via Drive API
     file_metadata = {
         "name": "T212 Portfolio Reports",
         "mimeType": "application/vnd.google-apps.document",
     }
     if REPORT_FOLDER_ID:
+        # Create directly in the user's shared folder — uses folder owner's quota
         file_metadata["parents"] = [REPORT_FOLDER_ID]
+        log.info("Creating doc in shared folder %s (uses folder owner's quota).", REPORT_FOLDER_ID)
+    else:
+        log.warning(
+            "GOOGLE_DRIVE_FOLDER_ID not set. Creating in service account's Drive. "
+            "This may fail if the SA has no storage quota. "
+            "Set GOOGLE_DRIVE_FOLDER_ID to a folder shared with the SA."
+        )
 
-    try:
-        file = _create_doc(drive_service, file_metadata)
-    except HttpError as exc:
-        if REPORT_FOLDER_ID:
-            log.warning(
-                "Failed to create doc in folder %s (%s). "
-                "Retrying without folder (service-account root).",
-                REPORT_FOLDER_ID, exc,
-            )
-            file_metadata.pop("parents", None)
-            file = _create_doc(drive_service, file_metadata)
-        else:
-            raise
+    file = _create_doc(drive_service, file_metadata)
     doc_id: str = file["id"]
 
     log.info(

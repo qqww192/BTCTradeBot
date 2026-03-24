@@ -189,25 +189,37 @@ def test_google_drive_connection() -> bool:
         except HttpError:
             log.warning("  WARN — Could not empty trash.")
 
-        # --- Step B: Drive API — create and delete a temp file (write test) ---
+        # --- Step B: Determine target folder ---
+        folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+        if folder_id:
+            log.info(f"  INFO — GOOGLE_DRIVE_FOLDER_ID set: files will be created in your shared folder.")
+        else:
+            log.warning("  WARN — GOOGLE_DRIVE_FOLDER_ID not set. Files will be created in the SA's own Drive.")
+            log.warning("         If the SA has no quota, creation will fail. Set GOOGLE_DRIVE_FOLDER_ID")
+            log.warning("         to a Google Drive folder shared with the SA (Editor access).")
+
+        # --- Step C: Drive API — create and delete a temp file (write test) ---
+        file_body = {"name": "__connection_test_temp__", "mimeType": "application/vnd.google-apps.document"}
+        if folder_id:
+            file_body["parents"] = [folder_id]
+
         test_file = None
         try:
-            test_file = drive_service.files().create(
-                body={"name": "__connection_test_temp__", "mimeType": "application/vnd.google-apps.document"},
-                fields="id",
-            ).execute()
+            test_file = drive_service.files().create(body=file_body, fields="id").execute()
             log.info(f"  PASS — Drive API write: created test doc (id={test_file['id']}).")
         except HttpError as e:
             log.error(f"  FAIL — Drive API write: cannot create files: {e}")
             if "storageQuotaExceeded" in str(e):
-                log.error("         Storage is STILL full after cleanup. The SA may share quota")
-                log.error("         with a personal Google account. Free space in that account,")
-                log.error("         or create a new SA in a different GCP project.")
+                log.error("         Storage quota exceeded. Set GOOGLE_DRIVE_FOLDER_ID to a folder")
+                log.error("         in YOUR Google Drive (shared with the SA as Editor).")
+                log.error("         Files created in a shared folder use the folder owner's quota.")
+            elif folder_id and "notFound" in str(e).lower():
+                log.error(f"         Folder {folder_id} not found or not shared with the SA.")
+                log.error("         Share the folder with the SA email as Editor.")
             else:
-                log.error("         Check: Google Drive API enabled? Service account has Editor/Owner role?")
+                log.error("         Check: Google Drive API enabled? SA has access to the folder?")
             return False
         finally:
-            # Always clean up the temp file
             if test_file:
                 try:
                     drive_service.files().delete(fileId=test_file["id"]).execute()
@@ -215,47 +227,47 @@ def test_google_drive_connection() -> bool:
                 except HttpError:
                     log.warning(f"  WARN — Could not delete test doc {test_file['id']}; delete it manually.")
 
-        # --- Step C: Docs API — verify the API is reachable ---
+        # --- Step D: Sheets API — create and delete a temp sheet (write test) ---
         try:
-            docs_service = build("docs", "v1", credentials=creds)
-            # If GOOGLE_DOC_ID is set, verify access to the master doc
-            doc_id = os.environ.get("GOOGLE_DOC_ID", "")
-            if doc_id:
-                doc = docs_service.documents().get(documentId=doc_id).execute()
-                log.info(f"  PASS — Docs API: master doc accessible: '{doc.get('title', 'Untitled')}'")
+            if folder_id:
+                # Create via Drive API in folder (uses folder owner's quota)
+                sheet_body = {
+                    "name": "__sheets_api_test__",
+                    "mimeType": "application/vnd.google-apps.spreadsheet",
+                    "parents": [folder_id],
+                }
+                temp_file = drive_service.files().create(body=sheet_body, fields="id").execute()
+                temp_sheet_id = temp_file["id"]
             else:
-                # Create a throwaway doc via Docs API to confirm it works, then delete via Drive
-                temp_doc = docs_service.documents().create(body={"title": "__docs_api_test__"}).execute()
-                temp_doc_id = temp_doc["documentId"]
-                log.info(f"  PASS — Docs API write: created test doc (id={temp_doc_id}).")
-                try:
-                    drive_service.files().delete(fileId=temp_doc_id).execute()
-                    log.info("  OK   — Cleaned up Docs API test doc.")
-                except HttpError:
-                    log.warning(f"  WARN — Could not delete Docs test doc {temp_doc_id}; delete it manually.")
-        except HttpError as e:
-            log.error(f"  FAIL — Docs API error: {e}")
-            log.error("         Check: Google Docs API enabled in Cloud Console?")
-            return False
-
-        # --- Step D: Sheets API — verify the API is reachable ---
-        try:
-            sheets_service = build("sheets", "v4", credentials=creds)
-            temp_sheet = sheets_service.spreadsheets().create(
-                body={"properties": {"title": "__sheets_api_test__"}},
-                fields="spreadsheetId",
-            ).execute()
-            temp_sheet_id = temp_sheet["spreadsheetId"]
+                sheets_service = build("sheets", "v4", credentials=creds)
+                temp_sheet = sheets_service.spreadsheets().create(
+                    body={"properties": {"title": "__sheets_api_test__"}},
+                    fields="spreadsheetId",
+                ).execute()
+                temp_sheet_id = temp_sheet["spreadsheetId"]
             log.info(f"  PASS — Sheets API write: created test sheet (id={temp_sheet_id}).")
             try:
                 drive_service.files().delete(fileId=temp_sheet_id).execute()
-                log.info("  OK   — Cleaned up Sheets API test sheet.")
+                log.info("  OK   — Cleaned up test sheet.")
             except HttpError:
                 log.warning(f"  WARN — Could not delete test sheet {temp_sheet_id}; delete it manually.")
         except HttpError as e:
             log.error(f"  FAIL — Sheets API error: {e}")
             log.error("         Check: Google Sheets API enabled in Cloud Console?")
             return False
+
+        # --- Step E: Docs API — verify access to master doc if set ---
+        doc_id = os.environ.get("GOOGLE_DOC_ID", "")
+        if doc_id:
+            try:
+                docs_service = build("docs", "v1", credentials=creds)
+                doc = docs_service.documents().get(documentId=doc_id).execute()
+                log.info(f"  PASS — Docs API: master doc accessible: '{doc.get('title', 'Untitled')}'")
+            except HttpError as e:
+                log.error(f"  FAIL — Docs API error: {e}")
+                return False
+        else:
+            log.info("  SKIP — GOOGLE_DOC_ID not set (will be created on first run).")
 
         log.info("  PASS — All Google API write permissions verified.")
         return True
