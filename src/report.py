@@ -69,10 +69,25 @@ def _get_or_create_doc(docs_service, drive_service, run_date: str) -> str:
     if REPORT_FOLDER_ID:
         file_metadata["parents"] = [REPORT_FOLDER_ID]
 
-    file = drive_service.files().create(
-        body=file_metadata,
-        fields="id",
-    ).execute()
+    try:
+        file = drive_service.files().create(
+            body=file_metadata,
+            fields="id",
+        ).execute()
+    except Exception as exc:
+        if REPORT_FOLDER_ID:
+            log.warning(
+                "Failed to create doc in folder %s (%s). "
+                "Retrying without folder (service-account root).",
+                REPORT_FOLDER_ID, exc,
+            )
+            file_metadata.pop("parents", None)
+            file = drive_service.files().create(
+                body=file_metadata,
+                fields="id",
+            ).execute()
+        else:
+            raise
     doc_id: str = file["id"]
 
     log.info(
