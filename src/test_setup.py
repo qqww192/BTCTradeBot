@@ -34,6 +34,23 @@ def main() -> None:
     log.info("T212 Portfolio Checker — Setup Test")
     log.info("=" * 60)
 
+    # ── Step 0: Diagnose service account ────────────────────────────────────
+    import os, json
+    sa_json = os.environ.get("GOOGLE_SA_JSON", "")
+    if sa_json:
+        try:
+            sa = json.loads(sa_json)
+            log.info("Service account email : %s", sa.get("client_email", "MISSING"))
+            log.info("Project ID            : %s", sa.get("project_id", "MISSING"))
+        except json.JSONDecodeError:
+            log.error("GOOGLE_SA_JSON is not valid JSON!")
+    else:
+        log.error("GOOGLE_SA_JSON is empty!")
+
+    folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
+    log.info("GOOGLE_DRIVE_FOLDER_ID: %s", folder_id if folder_id else "(not set)")
+    log.info("GOOGLE_SHEET_ID       : %s", os.environ.get("GOOGLE_SHEET_ID", "(not set)"))
+
     # ── Step 1: Test Google Sheets connection & create sheet ───────────────
     log.info("")
     log.info("STEP 1: Creating Google Sheet...")
