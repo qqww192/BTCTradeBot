@@ -51,6 +51,56 @@ def main() -> None:
     log.info("GOOGLE_DRIVE_FOLDER_ID: %s", folder_id if folder_id else "(not set)")
     log.info("GOOGLE_SHEET_ID       : %s", os.environ.get("GOOGLE_SHEET_ID", "(not set)"))
 
+    # ── Step 0.5: Test raw Google API auth before creating sheet ─────────
+    log.info("")
+    log.info("STEP 0.5: Testing Google API authentication...")
+    log.info("-" * 40)
+    try:
+        from google.oauth2 import service_account as _sa
+        from googleapiclient.discovery import build as _build
+
+        _creds = _sa.Credentials.from_service_account_info(
+            json.loads(sa_json),
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
+        )
+        log.info("  Credentials created OK for: %s", _creds.service_account_email)
+
+        # Test Drive API — list files (should return empty or a list)
+        _drive = _build("drive", "v3", credentials=_creds)
+        result = _drive.files().list(pageSize=1, fields="files(id,name)").execute()
+        log.info("  Drive API: OK (can list files)")
+
+        # Test Sheets API — just get the service object (no call yet)
+        _sheets = _build("sheets", "v4", credentials=_creds)
+        log.info("  Sheets API: service built OK")
+
+        # Test creating a minimal spreadsheet directly
+        log.info("  Attempting spreadsheet create (minimal test)...")
+        test_ss = _sheets.spreadsheets().create(
+            body={"properties": {"title": "test-delete-me"}},
+            fields="spreadsheetId",
+        ).execute()
+        test_id = test_ss["spreadsheetId"]
+        log.info("  Sheets create: OK! (test sheet: %s)", test_id)
+        # Clean up test sheet
+        _drive.files().delete(fileId=test_id).execute()
+        log.info("  Cleaned up test sheet.")
+
+    except Exception as e:
+        log.error("AUTH TEST FAILED: %s", e)
+        log.error("")
+        log.error("Troubleshooting checklist:")
+        log.error("  1. Is the Google Sheets API enabled for project '%s'?", sa.get("project_id", "?"))
+        log.error("     → https://console.cloud.google.com/apis/library/sheets.googleapis.com")
+        log.error("  2. Is the Google Drive API enabled for the same project?")
+        log.error("     → https://console.cloud.google.com/apis/library/drive.googleapis.com")
+        log.error("  3. Was GOOGLE_SA_JSON pasted correctly? (multiline JSON can break in GitHub Secrets)")
+        log.error("     Tip: Base64-encode it, store that, and decode in the workflow.")
+        sys.exit(1)
+
     # ── Step 1: Test Google Sheets connection & create sheet ───────────────
     log.info("")
     log.info("STEP 1: Creating Google Sheet...")
