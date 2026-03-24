@@ -6,10 +6,13 @@ Uses the google-genai SDK with Search grounding for up-to-date market context.
 """
 
 import os
+import re
 import logging
+import time
 from typing import Any
 
 from google import genai
+from google.genai import errors as genai_errors
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +75,26 @@ def analyse_portfolio(positions: list[dict[str, Any]], run_date: str) -> str:
 
     prompt = _build_prompt(positions, run_date)
 
-    response = client.models.generate_content(model=MODEL, contents=prompt)
+    max_retries = 3
+    response = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(model=MODEL, contents=prompt)
+            break
+        except genai_errors.ClientError as exc:
+            if exc.code == 429 and attempt < max_retries:
+                # Parse retry delay from error message, fall back to exponential backoff
+                wait = 60 * attempt  # default backoff
+                match = re.search(r"retry in ([\d.]+)s", str(exc), re.IGNORECASE)
+                if match:
+                    wait = float(match.group(1)) + 2  # add small buffer
+                log.warning(
+                    "Gemini rate-limited (attempt %d/%d). Waiting %.0fs before retry.",
+                    attempt, max_retries, wait,
+                )
+                time.sleep(wait)
+            else:
+                raise
 
     report = response.text
     if not report:
