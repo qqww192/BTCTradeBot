@@ -8,14 +8,15 @@ Manages a single spreadsheet with three tabs:
   - Market Overview: daily macro/sector analysis
 
 Authentication: Google Service Account via GOOGLE_SA_JSON env var.
-Sheet ID: GOOGLE_SHEET_ID env var (created automatically on first run).
+Sheet ID: GOOGLE_SHEET_ID env var (must be set to an existing spreadsheet).
+The spreadsheet must be shared with the service account email as Editor.
 """
 
 import os
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -25,11 +26,9 @@ log = logging.getLogger(__name__)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
 ]
 
 SHEET_ID: str = os.environ.get("GOOGLE_SHEET_ID", "")
-REPORT_FOLDER_ID: str = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
 
 # Tab names
 TAB_PORTFOLIO = "Portfolio"
@@ -64,159 +63,52 @@ def _get_credentials() -> service_account.Credentials:
     return service_account.Credentials.from_service_account_info(sa_dict, scopes=SCOPES)
 
 
-def _empty_trash(drive_service) -> None:
-    """Attempt to empty the service account's Drive trash to reclaim quota."""
-    try:
-        drive_service.files().emptyTrash().execute()
-        log.info("Emptied Drive trash to reclaim storage quota.")
-    except HttpError as e:
-        log.warning("Failed to empty Drive trash: %s", e)
+def _ensure_tabs_exist(sheets_service, sheet_id: str) -> None:
+    """Ensure the three required tabs exist; create any that are missing."""
+    spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+    existing_tabs = {s["properties"]["title"] for s in spreadsheet["sheets"]}
 
+    required_tabs = [TAB_PORTFOLIO, TAB_WATCHLIST, TAB_MARKET]
+    missing = [t for t in required_tabs if t not in existing_tabs]
+    if not missing:
+        return
 
-def _reclaim_storage(drive_service, keep_ids: set[str] | None = None) -> None:
-    """Delete all SA-owned files except those in keep_ids, then empty trash."""
-    keep_ids = keep_ids or set()
-    page_token = None
-    deleted = 0
-    while True:
-        resp = drive_service.files().list(
-            pageSize=100,
-            fields="nextPageToken, files(id, name)",
-            pageToken=page_token,
-        ).execute()
-        for f in resp.get("files", []):
-            if f["id"] not in keep_ids:
-                try:
-                    drive_service.files().delete(fileId=f["id"]).execute()
-                    deleted += 1
-                except HttpError:
-                    pass
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    if deleted:
-        log.info("Deleted %d old file(s) to free storage.", deleted)
-    _empty_trash(drive_service)
-
-
-def _find_existing_sheet(drive_service) -> Optional[str]:
-    """Search for an existing T212 Portfolio Tracker sheet."""
-    try:
-        results = drive_service.files().list(
-            q="name = 'T212 Portfolio Tracker' and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false",
-            fields="files(id)",
-            pageSize=1,
-        ).execute()
-        files = results.get("files", [])
-        if files:
-            return files[0]["id"]
-    except HttpError as e:
-        log.warning("Failed to search for existing sheet: %s", e)
-    return None
-
-
-def _get_or_create_sheet(sheets_service, drive_service) -> str:
-    """Returns the spreadsheet ID, creating one if needed."""
-    # 1. Try configured ID
-    if SHEET_ID:
-        try:
-            sheets_service.spreadsheets().get(spreadsheetId=SHEET_ID).execute()
-            return SHEET_ID
-        except HttpError:
-            log.warning("GOOGLE_SHEET_ID '%s' is not accessible. Will find or create.", SHEET_ID)
-
-    # 2. Search for existing
-    existing = _find_existing_sheet(drive_service)
-    if existing:
-        log.info("Found existing sheet %s — reusing.", existing)
-        return existing
-
-    # 3. Create new spreadsheet
-    log.info("Creating new T212 Portfolio Tracker spreadsheet.")
-
-    if REPORT_FOLDER_ID:
-        # Create via Drive API directly in the user's folder — avoids SA quota limits
-        log.info("Creating spreadsheet in shared folder %s (uses folder owner's quota).", REPORT_FOLDER_ID)
-        file_metadata = {
-            "name": "T212 Portfolio Tracker",
-            "mimeType": "application/vnd.google-apps.spreadsheet",
-            "parents": [REPORT_FOLDER_ID],
-        }
-        file = drive_service.files().create(body=file_metadata, fields="id").execute()
-        sheet_id = file["id"]
-
-        # Add the three tabs (Drive API only creates a default Sheet1)
-        # Rename Sheet1 → Portfolio, then add Watchlist and Market Overview
-        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
-        default_sheet_id = spreadsheet["sheets"][0]["properties"]["sheetId"]
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=sheet_id,
-            body={"requests": [
-                {"updateSheetProperties": {
-                    "properties": {"sheetId": default_sheet_id, "title": TAB_PORTFOLIO},
-                    "fields": "title",
-                }},
-                {"addSheet": {"properties": {"title": TAB_WATCHLIST}}},
-                {"addSheet": {"properties": {"title": TAB_MARKET}}},
-            ]},
-        ).execute()
-    else:
-        # No folder configured — create in SA's own Drive via Sheets API
-        log.warning(
-            "GOOGLE_DRIVE_FOLDER_ID not set. Creating in service account's Drive. "
-            "This may fail if the SA has no storage quota. "
-            "Set GOOGLE_DRIVE_FOLDER_ID to a folder shared with the SA."
-        )
-        body = {
-            "properties": {"title": "T212 Portfolio Tracker"},
-            "sheets": [
-                {"properties": {"title": TAB_PORTFOLIO}},
-                {"properties": {"title": TAB_WATCHLIST}},
-                {"properties": {"title": TAB_MARKET}},
-            ],
-        }
-        try:
-            spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
-        except HttpError as exc:
-            if exc.resp.status == 403 and "storageQuotaExceeded" in str(exc):
-                log.warning("Storage quota exceeded — deleting old files and retrying.")
-                keep = {SHEET_ID} if SHEET_ID else set()
-                _reclaim_storage(drive_service, keep_ids=keep)
-                spreadsheet = sheets_service.spreadsheets().create(body=body, fields="spreadsheetId").execute()
-            else:
-                raise
-        sheet_id = spreadsheet["spreadsheetId"]
-
-    # Write headers
-    sheets_service.spreadsheets().values().batchUpdate(
-        spreadsheetId=sheet_id,
-        body={
-            "valueInputOption": "RAW",
-            "data": [
-                {"range": f"'{TAB_PORTFOLIO}'!A1", "values": [PORTFOLIO_HEADERS]},
-                {"range": f"'{TAB_WATCHLIST}'!A1", "values": [WATCHLIST_HEADERS]},
-                {"range": f"'{TAB_MARKET}'!A1", "values": [MARKET_HEADERS]},
-            ],
-        },
+    requests = [{"addSheet": {"properties": {"title": tab}}} for tab in missing]
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=sheet_id, body={"requests": requests},
     ).execute()
 
-    log.info(
-        "\n%s\nNew Google Sheet created!\n"
-        "Sheet ID: %s\n"
-        "Set this as GOOGLE_SHEET_ID in your GitHub Secrets.\n%s",
-        "=" * 60, sheet_id, "=" * 60,
-    )
-    return sheet_id
+    # Write headers for newly created tabs
+    header_data = []
+    headers_map = {
+        TAB_PORTFOLIO: PORTFOLIO_HEADERS,
+        TAB_WATCHLIST: WATCHLIST_HEADERS,
+        TAB_MARKET: MARKET_HEADERS,
+    }
+    for tab in missing:
+        header_data.append({"range": f"'{tab}'!A1", "values": [headers_map[tab]]})
+    if header_data:
+        sheets_service.spreadsheets().values().batchUpdate(
+            spreadsheetId=sheet_id,
+            body={"valueInputOption": "RAW", "data": header_data},
+        ).execute()
+
+    log.info("Created missing tabs: %s", ", ".join(missing))
 
 
 class SheetManager:
     """High-level interface to read/write the T212 Portfolio Tracker sheet."""
 
     def __init__(self):
+        if not SHEET_ID:
+            raise EnvironmentError(
+                "GOOGLE_SHEET_ID environment variable is not set. "
+                "Set it to the ID of an existing Google Sheet shared with the service account."
+            )
         creds = _get_credentials()
         self.sheets = build("sheets", "v4", credentials=creds)
-        self.drive = build("drive", "v3", credentials=creds)
-        self.sheet_id = _get_or_create_sheet(self.sheets, self.drive)
+        self.sheet_id = SHEET_ID
+        _ensure_tabs_exist(self.sheets, self.sheet_id)
         self.url = f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/edit"
 
     # ── Portfolio tab ──────────────────────────────────────────────────────────

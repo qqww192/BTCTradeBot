@@ -120,11 +120,16 @@ def test_gemini_portfolio_analysis() -> bool:
         return False
 
 
-def test_google_drive_connection() -> bool:
-    """Test Google Drive/Docs/Sheets API connectivity including write permissions."""
+def test_google_sheets_connection() -> bool:
+    """Test Google Sheets API connectivity by reading the existing spreadsheet."""
     sa_json = os.environ.get("GOOGLE_SA_JSON", "")
     if not sa_json:
         log.error("  FAIL — GOOGLE_SA_JSON not set.")
+        return False
+
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+    if not sheet_id:
+        log.error("  FAIL — GOOGLE_SHEET_ID not set. Set it to an existing spreadsheet ID.")
         return False
 
     try:
@@ -133,144 +138,39 @@ def test_google_drive_connection() -> bool:
         from googleapiclient.errors import HttpError
 
         sa_dict = json.loads(sa_json)
-        scopes = [
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/documents",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ]
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = service_account.Credentials.from_service_account_info(sa_dict, scopes=scopes)
 
-        # --- Step A: Drive API — list files (read test) ---
-        drive_service = build("drive", "v3", credentials=creds)
-        results = drive_service.files().list(pageSize=1, fields="files(id, name)").execute()
-        files = results.get("files", [])
-        log.info(f"  PASS — Drive API read: {len(files)} file(s) visible to service account.")
+        sheets_service = build("sheets", "v4", credentials=creds)
 
-        # --- Step A2: Check storage quota ---
-        about = drive_service.about().get(fields="storageQuota").execute()
-        quota = about.get("storageQuota", {})
-        used = int(quota.get("usageInDrive", 0)) + int(quota.get("usageInDriveTrash", 0))
-        limit = int(quota.get("limit", 0))
-        used_mb = used / (1024 * 1024)
-        limit_mb = limit / (1024 * 1024) if limit else 0
-        log.info(f"  INFO — Storage: {used_mb:.1f} MB used" + (f" / {limit_mb:.0f} MB limit" if limit else " (no limit reported)"))
-        trash_bytes = int(quota.get("usageInDriveTrash", 0))
-        if trash_bytes > 0:
-            log.info(f"  INFO — {trash_bytes / (1024*1024):.1f} MB in trash.")
+        # --- Step A: Read the spreadsheet metadata ---
+        spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        title = spreadsheet.get("properties", {}).get("title", "Untitled")
+        tabs = [s["properties"]["title"] for s in spreadsheet.get("sheets", [])]
+        log.info(f"  PASS — Sheets API read: '{title}' with tabs: {tabs}")
 
-        # --- Step A3: Clean up — delete ALL files owned by this SA to free quota ---
-        page_token = None
-        deleted_count = 0
-        while True:
-            resp = drive_service.files().list(
-                pageSize=100,
-                fields="nextPageToken, files(id, name)",
-                pageToken=page_token,
-            ).execute()
-            batch_files = resp.get("files", [])
-            if not batch_files:
-                break
-            for f in batch_files:
-                try:
-                    drive_service.files().delete(fileId=f["id"]).execute()
-                    deleted_count += 1
-                except HttpError:
-                    pass
-            page_token = resp.get("nextPageToken")
-            if not page_token:
-                break
-        if deleted_count:
-            log.info(f"  INFO — Deleted {deleted_count} old file(s) to free storage.")
+        # --- Step B: Test write by updating a cell and clearing it ---
+        test_range = f"'{tabs[0]}'!ZZ1"
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=sheet_id,
+            range=test_range,
+            valueInputOption="RAW",
+            body={"values": [["__test__"]]},
+        ).execute()
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=sheet_id,
+            range=test_range,
+        ).execute()
+        log.info("  PASS — Sheets API write: read/write access confirmed.")
 
-        # Empty trash to actually reclaim quota
-        try:
-            drive_service.files().emptyTrash().execute()
-            log.info("  INFO — Emptied Drive trash.")
-        except HttpError:
-            log.warning("  WARN — Could not empty trash.")
-
-        # --- Step B: Determine target folder ---
-        folder_id = os.environ.get("GOOGLE_DRIVE_FOLDER_ID", "")
-        if folder_id:
-            log.info(f"  INFO — GOOGLE_DRIVE_FOLDER_ID set: files will be created in your shared folder.")
-        else:
-            log.warning("  WARN — GOOGLE_DRIVE_FOLDER_ID not set. Files will be created in the SA's own Drive.")
-            log.warning("         If the SA has no quota, creation will fail. Set GOOGLE_DRIVE_FOLDER_ID")
-            log.warning("         to a Google Drive folder shared with the SA (Editor access).")
-
-        # --- Step C: Drive API — create and delete a temp file (write test) ---
-        file_body = {"name": "__connection_test_temp__", "mimeType": "application/vnd.google-apps.document"}
-        if folder_id:
-            file_body["parents"] = [folder_id]
-
-        test_file = None
-        try:
-            test_file = drive_service.files().create(body=file_body, fields="id").execute()
-            log.info(f"  PASS — Drive API write: created test doc (id={test_file['id']}).")
-        except HttpError as e:
-            log.error(f"  FAIL — Drive API write: cannot create files: {e}")
-            if "storageQuotaExceeded" in str(e):
-                log.error("         Storage quota exceeded. Set GOOGLE_DRIVE_FOLDER_ID to a folder")
-                log.error("         in YOUR Google Drive (shared with the SA as Editor).")
-                log.error("         Files created in a shared folder use the folder owner's quota.")
-            elif folder_id and "notFound" in str(e).lower():
-                log.error(f"         Folder {folder_id} not found or not shared with the SA.")
-                log.error("         Share the folder with the SA email as Editor.")
-            else:
-                log.error("         Check: Google Drive API enabled? SA has access to the folder?")
-            return False
-        finally:
-            if test_file:
-                try:
-                    drive_service.files().delete(fileId=test_file["id"]).execute()
-                    log.info("  OK   — Cleaned up test doc.")
-                except HttpError:
-                    log.warning(f"  WARN — Could not delete test doc {test_file['id']}; delete it manually.")
-
-        # --- Step D: Sheets API — create and delete a temp sheet (write test) ---
-        try:
-            if folder_id:
-                # Create via Drive API in folder (uses folder owner's quota)
-                sheet_body = {
-                    "name": "__sheets_api_test__",
-                    "mimeType": "application/vnd.google-apps.spreadsheet",
-                    "parents": [folder_id],
-                }
-                temp_file = drive_service.files().create(body=sheet_body, fields="id").execute()
-                temp_sheet_id = temp_file["id"]
-            else:
-                sheets_service = build("sheets", "v4", credentials=creds)
-                temp_sheet = sheets_service.spreadsheets().create(
-                    body={"properties": {"title": "__sheets_api_test__"}},
-                    fields="spreadsheetId",
-                ).execute()
-                temp_sheet_id = temp_sheet["spreadsheetId"]
-            log.info(f"  PASS — Sheets API write: created test sheet (id={temp_sheet_id}).")
-            try:
-                drive_service.files().delete(fileId=temp_sheet_id).execute()
-                log.info("  OK   — Cleaned up test sheet.")
-            except HttpError:
-                log.warning(f"  WARN — Could not delete test sheet {temp_sheet_id}; delete it manually.")
-        except HttpError as e:
-            log.error(f"  FAIL — Sheets API error: {e}")
-            log.error("         Check: Google Sheets API enabled in Cloud Console?")
-            return False
-
-        # --- Step E: Docs API — verify access to master doc if set ---
-        doc_id = os.environ.get("GOOGLE_DOC_ID", "")
-        if doc_id:
-            try:
-                docs_service = build("docs", "v1", credentials=creds)
-                doc = docs_service.documents().get(documentId=doc_id).execute()
-                log.info(f"  PASS — Docs API: master doc accessible: '{doc.get('title', 'Untitled')}'")
-            except HttpError as e:
-                log.error(f"  FAIL — Docs API error: {e}")
-                return False
-        else:
-            log.info("  SKIP — GOOGLE_DOC_ID not set (will be created on first run).")
-
-        log.info("  PASS — All Google API write permissions verified.")
+        log.info("  PASS — Google Sheets connection verified.")
         return True
+    except HttpError as e:
+        log.error(f"  FAIL — Google Sheets API error: {e}")
+        if "PERMISSION_DENIED" in str(e):
+            log.error("         The spreadsheet is not shared with the service account.")
+            log.error("         Share it with the SA email as Editor.")
+        return False
     except Exception as e:
         log.error(f"  FAIL — Google API error: {e}")
         return False
@@ -377,8 +277,8 @@ def run_test_case_2() -> dict[str, bool]:
     log.info("  Step 2/4: Gemini portfolio analysis...")
     results["2.2 Gemini analysis"] = test_gemini_portfolio_analysis()
 
-    log.info("  Step 3/4: Google Drive / Docs connection...")
-    results["2.3 Google Drive"] = test_google_drive_connection()
+    log.info("  Step 3/4: Google Sheets connection...")
+    results["2.3 Google Sheets"] = test_google_sheets_connection()
 
     log.info("  Step 4/4: Telegram snapshot delivery...")
     results["2.4 Telegram delivery"] = test_telegram_connection()
