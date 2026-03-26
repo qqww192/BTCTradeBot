@@ -37,18 +37,15 @@ TAB_MARKET = "Market Overview"
 
 # Column headers for each tab
 PORTFOLIO_HEADERS = [
-    "Pie Name", "Market (US/UK)", "Symbol", "Quantity", "Avg Price",
-    "Current Price", "P/L", "Analysis Result", "Priority (1-5)",
-    "Last Updated", "Created Date",
+    "Pie", "Symbol", "Amount", "Price", "Weight %", "Analysis", "Last Updated",
 ]
 
 WATCHLIST_HEADERS = [
-    "Symbol", "Market (US/UK)", "Analysis Result", "Last Updated", "Created Date",
+    "Symbol", "Analysis", "Last Updated",
 ]
 
 MARKET_HEADERS = [
-    "Date", "Region", "Index/Sector", "Weight in Portfolio",
-    "Momentum Analysis", "Last Updated",
+    "Date", "Indicator", "Value", "Change %", "Sentiment", "Analysis", "Last Updated",
 ]
 
 
@@ -113,75 +110,69 @@ class SheetManager:
 
     # ── Portfolio tab ──────────────────────────────────────────────────────────
 
-    def sync_portfolio(self, positions: list[dict[str, Any]]) -> None:
+    def sync_portfolio(self, positions: list[dict[str, Any]], prices: dict[str, float] | None = None) -> None:
         """
         Sync T212 positions into the Portfolio tab.
-        Merges with existing rows to preserve Priority and Created Date.
+        Merges with existing rows to preserve analysis.
+        prices: optional dict of symbol -> live price from yfinance.
         """
         existing = self._read_tab(TAB_PORTFOLIO)
-        # Build lookup by symbol
-        existing_by_symbol: dict[str, dict] = {}
+        existing_by_symbol: dict[str, list] = {}
         for row in existing:
-            if len(row) >= 3 and row[2]:  # Symbol in column C
-                existing_by_symbol[row[2]] = row
+            if len(row) >= 2 and row[1]:  # Symbol in column B
+                existing_by_symbol[row[1]] = row
 
+        prices = prices or {}
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        rows = []
+
+        # Calculate total portfolio value for weight
+        total_value = 0
+        pos_data = []
         for pos in positions:
             ticker = pos.get("ticker", "N/A")
+            qty = float(pos.get("quantity", 0))
+            price = prices.get(ticker) or float(pos.get("currentPrice", 0))
+            value = qty * price
+            total_value += value
+            pos_data.append((pos, ticker, qty, price, value))
+
+        rows = []
+        for pos, ticker, qty, price, value in pos_data:
             pie_name = pos.get("pieAccountName", "")
-            market = _detect_market(ticker)
-            qty = pos.get("quantity", 0)
-            avg_price = pos.get("averagePrice", 0)
-            current = pos.get("currentPrice", 0)
-            ppl = pos.get("ppl", 0)
+            weight = f"{value / total_value * 100:.1f}" if total_value else "0"
 
             old = existing_by_symbol.get(ticker, [])
-            # Preserve existing analysis, priority, created date
-            analysis = old[7] if len(old) > 7 else ""
-            priority = old[8] if len(old) > 8 else "3"  # default priority
-            last_updated = old[9] if len(old) > 9 else now
-            created_date = old[10] if len(old) > 10 else now
+            analysis = old[5] if len(old) > 5 else ""
 
-            rows.append([
-                pie_name, market, ticker, qty, avg_price, current, ppl,
-                analysis, priority, last_updated, created_date,
-            ])
+            rows.append([pie_name, ticker, qty, price, weight, analysis, now])
 
-        # Sort by priority (ascending = highest priority first)
-        rows.sort(key=lambda r: int(r[8]) if str(r[8]).isdigit() else 3)
+        # Sort by weight descending
+        rows.sort(key=lambda r: float(r[4]) if r[4] else 0, reverse=True)
 
-        # Write header + data
         all_rows = [PORTFOLIO_HEADERS] + rows
         self._write_tab(TAB_PORTFOLIO, all_rows)
         log.info("Portfolio tab synced with %d positions.", len(rows))
 
     def get_portfolio_for_analysis(self) -> list[dict]:
         """
-        Returns portfolio stocks sorted by priority, with their current data.
-        Only returns stocks that need analysis (priority > 0).
+        Returns portfolio stocks sorted by weight (highest first).
+        Columns: Pie, Symbol, Amount, Price, Weight %, Analysis, Last Updated
         """
         rows = self._read_tab(TAB_PORTFOLIO)
         stocks = []
         for row in rows:
-            if len(row) < 3 or not row[2]:
-                continue
-            priority = int(row[8]) if len(row) > 8 and str(row[8]).isdigit() else 3
-            if priority <= 0:
+            if len(row) < 2 or not row[1]:
                 continue
             stocks.append({
-                "symbol": row[2],
-                "market": row[1] if len(row) > 1 else "",
-                "quantity": row[3] if len(row) > 3 else 0,
-                "avg_price": row[4] if len(row) > 4 else 0,
-                "current_price": row[5] if len(row) > 5 else 0,
-                "ppl": row[6] if len(row) > 6 else 0,
-                "priority": priority,
-                "last_updated": row[9] if len(row) > 9 else "",
-                "row_index": rows.index(row) + 1,  # 1-based for Sheets
+                "symbol": row[1],
+                "pie": row[0] if len(row) > 0 else "",
+                "amount": row[2] if len(row) > 2 else 0,
+                "price": row[3] if len(row) > 3 else 0,
+                "weight": row[4] if len(row) > 4 else "0",
+                "last_updated": row[6] if len(row) > 6 else "",
             })
-        # Sort: priority 1 first (most important), then by last updated (oldest first)
-        stocks.sort(key=lambda s: (s["priority"], s.get("last_updated", "")))
+        # Sort by weight descending (analyse biggest positions first)
+        stocks.sort(key=lambda s: float(s.get("weight", 0)), reverse=True)
         return stocks
 
     def update_portfolio_analysis(self, symbol: str, analysis: str) -> None:
@@ -189,13 +180,11 @@ class SheetManager:
         rows = self._read_tab(TAB_PORTFOLIO)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for i, row in enumerate(rows):
-            if len(row) >= 3 and row[2] == symbol:
-                # Pad row if needed
-                while len(row) < 11:
+            if len(row) >= 2 and row[1] == symbol:
+                while len(row) < 7:
                     row.append("")
-                row[7] = analysis       # Analysis Result
-                row[9] = now            # Last Updated
-                # Write just this row back (i+1 because header is row 1)
+                row[5] = analysis       # Analysis
+                row[6] = now            # Last Updated
                 self.sheets.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
                     range=f"'{TAB_PORTFOLIO}'!A{i + 1}",
@@ -214,8 +203,7 @@ class SheetManager:
             if len(row) >= 1 and row[0]:
                 watchlist.append({
                     "symbol": row[0],
-                    "market": row[1] if len(row) > 1 else "",
-                    "existing_analysis": row[2] if len(row) > 2 else "",
+                    "existing_analysis": row[1] if len(row) > 1 else "",
                     "row_index": i + 1,
                 })
         return watchlist
@@ -226,12 +214,10 @@ class SheetManager:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         for i, row in enumerate(rows):
             if len(row) >= 1 and row[0] == symbol:
-                while len(row) < 5:
+                while len(row) < 3:
                     row.append("")
-                row[2] = analysis    # Analysis Result
-                row[3] = now         # Last Updated
-                if not row[4]:
-                    row[4] = now     # Created Date (first time)
+                row[1] = analysis    # Analysis
+                row[2] = now         # Last Updated
                 self.sheets.spreadsheets().values().update(
                     spreadsheetId=self.sheet_id,
                     range=f"'{TAB_WATCHLIST}'!A{i + 1}",
@@ -245,10 +231,9 @@ class SheetManager:
     def write_market_overview(self, entries: list[dict]) -> None:
         """
         Write daily market overview entries.
-        Each entry: {date, region, index_sector, weight, analysis}
+        Each entry: {indicator, value, change_pct, sentiment, analysis}
         """
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        # Read existing to append (keep history)
         existing = self._read_tab(TAB_MARKET)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -259,9 +244,10 @@ class SheetManager:
         for entry in entries:
             new_rows.append([
                 today,
-                entry.get("region", ""),
-                entry.get("index_sector", ""),
-                entry.get("weight", ""),
+                entry.get("indicator", ""),
+                entry.get("value", ""),
+                entry.get("change_pct", ""),
+                entry.get("sentiment", ""),
                 entry.get("analysis", ""),
                 now,
             ])
