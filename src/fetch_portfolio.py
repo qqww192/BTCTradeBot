@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -124,10 +125,14 @@ def fetch_portfolio() -> list[dict[str, Any]]:
 
     all_positions = []
 
-    for pie_summary in pies_summary:
+    for i, pie_summary in enumerate(pies_summary):
         pie_id = pie_summary.get("id")
         if not pie_id:
             continue
+
+        # T212 API rate limit: wait between requests
+        if i > 0:
+            time.sleep(1.5)
 
         detail = fetch_pie_detail(pie_id)
         if not detail:
@@ -147,9 +152,10 @@ def fetch_portfolio() -> list[dict[str, Any]]:
                 continue
 
             result = inst.get("result") or {}
-            value = float(result.get("value", 0))
-            invested = float(result.get("investedValue", 0))
-            ppl = float(result.get("result", 0))
+            # T212 uses priceAvg-prefixed keys in pie instrument results
+            value = float(result.get("priceAvgValue", 0) or result.get("value", 0))
+            invested = float(result.get("priceAvgInvestedValue", 0) or result.get("investedValue", 0))
+            ppl = float(result.get("priceAvgResult", 0) or result.get("result", 0))
 
             qty = float(inst.get("ownedQuantity", 0))
             current_share = float(inst.get("currentShare", 0))
@@ -195,37 +201,40 @@ def t212_to_yfinance(t212_ticker: str) -> str:
     """
     Convert T212 ticker format to yfinance ticker format.
 
-    T212 uses: VUAG_EQ_L, AAPL_US_EQ, CSPX_EQ_L, BRK.B_US_EQ, etc.
-    yfinance uses: VUAG.L, AAPL, CSPX.L, BRK-B, etc.
+    T212 actual formats (from pies API):
+      VUAGl_EQ      → VUAG.L     (lowercase 'l' suffix = London)
+      BRK_B_US_EQ   → BRK-B      (US stock, dot→dash)
+      AAPL_US_EQ    → AAPL       (US stock)
+      VWRPl_EQ      → VWRP.L     (London)
+      SSLNl_EQ      → SSLN.L     (London)
     """
     if not t212_ticker or t212_ticker == "UNKNOWN":
         return t212_ticker
 
-    exchange_map = {
-        "L": ".L",
-        "US": "",
-        "DE": ".DE",
-        "AS": ".AS",
-        "PA": ".PA",
-        "MI": ".MI",
-        "MC": ".MC",
-        "SW": ".SW",
-        "TO": ".TO",
-        "HK": ".HK",
-        "LSE": ".L",
+    # Exchange suffix map (lowercase letter at end of symbol before _EQ)
+    exchange_suffix_map = {
+        "l": ".L",     # London
+        "d": ".DE",    # Germany (Deutsche Börse)
+        "a": ".AS",    # Amsterdam
+        "p": ".PA",    # Paris
+        "m": ".MI",    # Milan
     }
 
     parts = t212_ticker.split("_")
+
+    # Check for US stocks: e.g. BRK_B_US_EQ or AAPL_US_EQ
+    if "US" in parts:
+        # Reconstruct symbol from parts before "US"
+        us_idx = parts.index("US")
+        symbol = "_".join(parts[:us_idx])
+        # yfinance uses dashes not underscores: BRK_B → BRK-B
+        return symbol.replace("_", "-")
+
+    # Check for exchange suffix on the symbol: e.g. VUAGl_EQ
     symbol = parts[0]
+    if len(symbol) > 1 and symbol[-1] in exchange_suffix_map:
+        base = symbol[:-1]  # strip the exchange letter
+        suffix = exchange_suffix_map[symbol[-1]]
+        return f"{base}{suffix}"
 
-    # yfinance uses dashes not dots in symbols like BRK-B
-    yf_symbol = symbol.replace(".", "-") if "." in symbol else symbol
-
-    # Find exchange code (skip "EQ" which is just equity type)
-    for part in parts[1:]:
-        if part == "EQ":
-            continue
-        if part in exchange_map:
-            return f"{yf_symbol}{exchange_map[part]}"
-
-    return yf_symbol
+    return symbol
