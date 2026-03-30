@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from fetch_portfolio import fetch_portfolio, t212_to_yfinance
 from sheets import SheetManager
 from market_data import (
-    get_batch_prices,
+    get_batch_info,
     get_signal_metrics,
     build_stock_context,
     evaluate_alert,
@@ -170,16 +170,22 @@ def main() -> None:
         if len(positions) > 10:
             log.info("    ... and %d more", len(positions) - 10)
 
-        # Map T212 tickers to yfinance format for price lookup
+        # Map T212 tickers to yfinance format for price + name lookup
         t212_tickers = [p["ticker"] for p in positions if p.get("ticker")]
         yf_tickers = [t212_to_yfinance(t) for t in t212_tickers]
         log.info("  Ticker mapping: %s", dict(list(zip(t212_tickers, yf_tickers))[:5]))
-        yf_prices = get_batch_prices(yf_tickers)
-        # Map prices back to T212 ticker keys
+        yf_info = get_batch_info(yf_tickers)
+        # Map prices and names back to T212 ticker keys
         live_prices = {}
         for t212_t, yf_t in zip(t212_tickers, yf_tickers):
-            if yf_t in yf_prices and yf_prices[yf_t]:
-                live_prices[t212_t] = yf_prices[yf_t]
+            info = yf_info.get(yf_t, {})
+            if info.get("price"):
+                live_prices[t212_t] = info["price"]
+            # Inject stock name from yfinance into position (T212 pies don't return names)
+            if info.get("name"):
+                for p in positions:
+                    if p["ticker"] == t212_t and not p.get("name"):
+                        p["name"] = info["name"]
         log.info("  Live prices fetched for %d/%d symbols.", len(live_prices), len(t212_tickers))
         sheet.sync_portfolio(positions, prices=live_prices)
 
