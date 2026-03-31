@@ -31,8 +31,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
-SHEET_ID: str = os.environ.get("GOOGLE_SHEET_ID", "")
-
 # Tab names
 TAB_PORTFOLIO = "Portfolio"
 TAB_SIGNALS = "Signals"
@@ -104,14 +102,15 @@ class SheetManager:
     """High-level interface to read/write the T212 Portfolio Tracker sheet."""
 
     def __init__(self):
-        if not SHEET_ID:
+        sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+        if not sheet_id:
             raise EnvironmentError(
                 "GOOGLE_SHEET_ID environment variable is not set. "
                 "Set it to the ID of an existing Google Sheet shared with the service account."
             )
         creds = _get_credentials()
         self.sheets = build("sheets", "v4", credentials=creds)
-        self.sheet_id = SHEET_ID
+        self.sheet_id = sheet_id
         _ensure_tabs_exist(self.sheets, self.sheet_id)
         self.url = f"https://docs.google.com/spreadsheets/d/{self.sheet_id}/edit"
 
