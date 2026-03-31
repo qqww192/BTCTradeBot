@@ -1,21 +1,30 @@
 """
 conftest.py
-Pre-mock Google libraries that depend on the cryptography C extension,
-which may not be available in all environments (e.g. CI sandboxes).
+Pre-mock libraries that depend on native C extensions or are not installed
+in the test environment (e.g. CI sandboxes).
 """
 
 import sys
 from unittest.mock import MagicMock
 
-# These modules depend on cryptography's Rust/C backend.
+# These modules may not be installed or depend on native backends.
 # Mock them before any test file imports src modules.
 MOCK_MODULES = [
+    "google",
+    "google.genai",
+    "google.genai.errors",
     "google.generativeai",
+    "google.generativeai.types",
+    "google.generativeai.protos",
     "google.oauth2",
     "google.oauth2.service_account",
     "googleapiclient",
     "googleapiclient.discovery",
     "googleapiclient.errors",
+    "httpx",
+    "yfinance",
+    "numpy",
+    "dotenv",
 ]
 
 for mod in MOCK_MODULES:

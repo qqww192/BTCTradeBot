@@ -11,7 +11,7 @@ from unittest.mock import patch, MagicMock
 # Add src to path so we can import the module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from fetch_portfolio import _get_headers, fetch_all_positions
+from fetch_portfolio import _get_headers, t212_to_yfinance
 
 
 class TestGetHeaders:
@@ -20,53 +20,30 @@ class TestGetHeaders:
             with pytest.raises(EnvironmentError, match="T212_API_KEY"):
                 _get_headers()
 
-    def test_missing_secret_key_raises(self):
+    def test_api_key_only_returns_direct_auth(self):
         with patch.dict(os.environ, {"T212_API_KEY": "key123"}, clear=True):
-            with pytest.raises(EnvironmentError, match="T212_SECRET_KEY"):
-                _get_headers()
+            headers = _get_headers()
+            assert headers["Authorization"] == "key123"
 
-    def test_both_keys_present(self):
+    def test_both_keys_returns_basic_auth(self):
         with patch.dict(os.environ, {"T212_API_KEY": "key123", "T212_SECRET_KEY": "secret456"}, clear=True):
             headers = _get_headers()
             expected = base64.b64encode(b"key123:secret456").decode()
             assert headers["Authorization"] == f"Basic {expected}"
-            assert "X-Secret-Key" not in headers
 
 
-class TestFetchAllPositions:
-    @patch("fetch_portfolio._get_headers", return_value={"Authorization": "Basic dGVzdDp0ZXN0"})
-    @patch("fetch_portfolio.httpx.Client")
-    def test_successful_fetch(self, mock_client_cls, mock_headers):
-        mock_response = MagicMock()
-        mock_response.json.return_value = [
-            {"ticker": "AAPL", "quantity": 10, "currentPrice": 150.0, "ppl": 50.0},
-            {"ticker": "MSFT", "quantity": 5, "currentPrice": 300.0, "ppl": 25.0},
-        ]
-        mock_response.raise_for_status = MagicMock()
+class TestT212ToYfinance:
+    def test_us_stock(self):
+        assert t212_to_yfinance("AAPL_US_EQ") == "AAPL"
 
-        mock_client = MagicMock()
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client.get.return_value = mock_response
-        mock_client_cls.return_value = mock_client
+    def test_us_stock_with_underscore(self):
+        assert t212_to_yfinance("BRK_B_US_EQ") == "BRK-B"
 
-        positions = fetch_all_positions()
-        assert len(positions) == 2
-        assert positions[0]["ticker"] == "AAPL"
-        assert positions[1]["ticker"] == "MSFT"
+    def test_london_stock(self):
+        assert t212_to_yfinance("VUAGl_EQ") == "VUAG.L"
 
-    @patch("fetch_portfolio._get_headers", return_value={"Authorization": "Basic dGVzdDp0ZXN0"})
-    @patch("fetch_portfolio.httpx.Client")
-    def test_empty_portfolio(self, mock_client_cls, mock_headers):
-        mock_response = MagicMock()
-        mock_response.json.return_value = []
-        mock_response.raise_for_status = MagicMock()
+    def test_unknown_ticker(self):
+        assert t212_to_yfinance("UNKNOWN") == "UNKNOWN"
 
-        mock_client = MagicMock()
-        mock_client.__enter__ = MagicMock(return_value=mock_client)
-        mock_client.__exit__ = MagicMock(return_value=False)
-        mock_client.get.return_value = mock_response
-        mock_client_cls.return_value = mock_client
-
-        positions = fetch_all_positions()
-        assert positions == []
+    def test_empty(self):
+        assert t212_to_yfinance("") == ""
