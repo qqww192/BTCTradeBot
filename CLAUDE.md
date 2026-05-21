@@ -1,14 +1,10 @@
 # FinancialAdvisor — Claude Code Context
 
 ## Project overview
-Automated financial monitoring and trading system for John's crypto.com account.
-Two independent pipelines run in parallel:
+Automated BTC/USDT grid trading bot for John's crypto.com account.
 
-1. **FinancialAdvisor (existing)** — weekly ETF portfolio analysis via Trading 212 API,
-   appends AI-generated reports to a Google Doc. Runs on GitHub Actions.
-
-2. **Grid Trading Bot (new)** — adaptive BTC/USDT spot grid trader on crypto.com Exchange.
-   Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04).
+**Grid Trading Bot** — adaptive BTC/USDT spot grid trader on crypto.com Exchange.
+Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04).
 
 ## Stack
 - Language: Python 3.11

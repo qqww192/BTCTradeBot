@@ -3,3 +3,6 @@ credentials/
 __pycache__/
 *.pyc
 *.log
+.venv/
+data/*.json
+data/*.lock
