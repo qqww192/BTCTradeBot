@@ -1,43 +1,93 @@
-# T212 Portfolio Checker — Claude Code Context
+# FinancialAdvisor — Claude Code Context
 
-## Project Overview
-An automated pipeline that fetches a Trading 212 portfolio via their REST API, analyses each position using Claude (Anthropic API), and writes a formatted report to Google Drive as a Google Doc. The pipeline is scheduled via GitHub Actions and runs entirely in the cloud — no local machine required.
+## Project overview
+Automated financial monitoring and trading system for John's crypto.com account.
+Two independent pipelines run in parallel:
+
+1. **FinancialAdvisor (existing)** — weekly ETF portfolio analysis via Trading 212 API,
+   appends AI-generated reports to a Google Doc. Runs on GitHub Actions.
+
+2. **Grid Trading Bot (new)** — adaptive BTC/USDT spot grid trader on crypto.com Exchange.
+   Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04).
 
 ## Stack
-- Language: Python 3.12
-- Package manager: pip + `requirements.txt`
-- Key libraries: `httpx` (API calls), `google-api-python-client` (Drive), `google-generativeai` (Gemini API)
-- Scheduler: GitHub Actions (cron)
-- Secrets store: GitHub Actions Secrets (never `.env` files in repo)
+- Language: Python 3.11
+- Key libs: `httpx`, `python-dotenv`, `google-generativeai`
+- AI: Google Gemini 1.5 Flash (weekly optimisation + search grounding)
+- Infrastructure: Oracle Cloud VM (primary), GitHub Actions (daily/weekly backup jobs)
+- Delivery: Telegram bot
+- Secrets: `.env` file on the Oracle VM — never committed to git
 
-## Common Commands
+## Common commands
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Activate virtualenv (Oracle VM)
+source .venv/bin/activate
 
-# Run locally (requires .env file — see docs/setup.md)
-python src/main.py
+# Run grid trader once (5-min job)
+python3 src/trading/grid_trader.py
 
-# Run tests
-pytest tests/
+# Run regime classifier (4-hourly job)
+python3 src/trading/regime_classifier.py
 
-# Lint
-ruff check src/
+# Send daily report manually
+python3 src/trading/daily_reporter.py
+
+# Run weekly Gemini optimisation
+python3 src/trading/gemini_optimizer.py
+
+# Check live cron jobs
+crontab -l
+
+# Tail live grid log
+tail -f logs/grid_trader.log
+
+# View current week P&L
+python3 -c "import json; print(json.load(open('data/weekly_state.json')))"
+
+# View recent trades
+tail -20 data/trades.json | python3 -m json.tool
 ```
 
 ## Architecture
-Full design lives in `docs/architecture.md`. Read before making structural changes.
+See `docs/architecture.md`. Key points:
+- `src/trading/cdx_client.py` — all crypto.com API calls. Auth via HMAC-SHA256.
+- `src/trading/grid_trader.py` — 5-min orchestrator. Single point of entry.
+- `src/trading/risk_manager.py` — kill switch guardian. Read this before touching P&L logic.
+- `src/trading/regime_classifier.py` — ATR-14 + Bollinger Band Width. Updates `data/regime.json`.
+- `src/trading/gemini_optimizer.py` — Sunday AI review with walk-forward validation.
+- `config/grid_params.json` — live grid parameters. Updated by Gemini; read by grid_trader.
+- `data/weekly_state.json` — current week P&L + kill switch flag. NEVER delete this.
+- `data/trades.json` — append-only trade ledger. One JSON object per line.
 
-## Skills
-Task-specific procedures live in `skills/`. Read `skills/README.md` first.
+## Constraints — read these first
+- **Never commit `.env`** — it contains live API keys with trading permissions.
+- **Never disable the kill switch** — it is in `risk_manager.py:is_kill_switch_active()`.
+- **Never use market orders** — all orders must be `POST_ONLY` limit orders (maker fee = 0.25%).
+- **Never increase `capital_pct` above 0.80** — always keep ≥20% as reserve.
+- **Never modify `data/weekly_state.json` manually** — use `risk_manager.reset_week()` if needed.
+- **Never add leverage or margin** — spot only, no derivatives.
+- The crypto.com API key has trade permission but NOT withdrawal permission. Keep it that way.
 
-## Constraints — Read These First
-- **Never** commit API keys, tokens, or secrets — all secrets go in GitHub Actions Secrets or a local `.env` (gitignored)
-- **Never** modify `.github/workflows/schedule.yml` without understanding the cron syntax — a bad schedule could spam the API
-- Trading 212 API is rate-limited — always use the paginated fetch in `src/fetch_portfolio.py`, never call in a loop without the cursor
-- Google Drive writes are append-only by default — do not overwrite the master sheet without confirmation
-- The `.env` file is gitignored; `docs/setup.md` explains how to populate it
+## What NOT to touch
+- `data/trades.json` — append-only. Never edit existing lines.
+- `data/weekly_state.json` — managed entirely by `risk_manager.py`.
+- `oracle_setup/setup.sh` — only modify if changing VM setup procedure.
 
-## What NOT to Touch
-- `.github/workflows/` — only modify the schedule cron expression, nothing else, without reading the Actions docs
-- `credentials/` — this folder is gitignored and holds the Google service account JSON locally; never commit it
+## Grid trading key numbers
+- Maker fee: 0.25% per order → minimum profitable spacing: 0.55%
+- Default spacing: 0.8% (safe zone above break-even)
+- Weekly kill switch: -10% of total capital (£15 on £150)
+- Warning threshold: -5% of total capital (£7.50)
+- Grid recentres when BTC moves >3% from last calibration price
+- Regime reclassification: every 4 hours via ATR-14 + Bollinger Band Width
+
+## Self-learning loop
+- **Inner loop (every 5 min):** fill detection → risk check → order placement
+- **Outer loop (Sunday 23:00 UTC):** Gemini reviews 7-day metrics, proposes new params,
+  validates against 30-day walk-forward simulation, updates `config/grid_params.json`
+
+## Git workflow
+- Branch from `main` for every feature or fix
+- The Oracle VM runs `git pull --ff-only` daily at 01:00 UTC to pick up config changes
+- Never push directly to `main`
+- Commit `config/grid_params.json` after every manual param change so the VM picks it up
