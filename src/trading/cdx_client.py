@@ -75,6 +75,8 @@ class CDXClient:
             "sig":     self._sign(method, req_id, params, nonce),
         }
         resp = self.client.post(f"{CDX_BASE}/{method}", json=payload)
+        if resp.status_code == 429:
+            raise CDXError("Rate limited (HTTP 429) — back off")
         resp.raise_for_status()
         body = resp.json()
         if body.get("code", 0) != 0:
@@ -170,7 +172,10 @@ class CDXClient:
                 "exec_inst":       ["POST_ONLY"],   # maker only — saves fees
             },
         )
-        return result.get("order_id", "")
+        order_id = result.get("order_id", "").strip()
+        if not order_id:
+            raise CDXError("API accepted order but returned no order_id")
+        return order_id
 
     def cancel_order(self, instrument: str, order_id: str) -> None:
         """Cancel a single order by ID."""

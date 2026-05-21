@@ -8,7 +8,7 @@ and sends a formatted Telegram message.
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -25,11 +25,14 @@ def send(message: str) -> None:
     if not token or not chat_id:
         print(f"[reporter] Telegram not configured — message: {message}")
         return
-    httpx.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
-        timeout=10,
-    )
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[reporter] Telegram send failed: {e}")
 
 
 def format_report() -> str:
@@ -101,6 +104,19 @@ def format_report() -> str:
 
     if not yesterday:
         lines.insert(4, f"_No trades yesterday._")
+
+    # Heartbeat staleness check — warn if bot hasn't run in >25 minutes
+    heartbeat_file = ROOT / "data" / "last_heartbeat.json"
+    if heartbeat_file.exists():
+        try:
+            hb = json.loads(heartbeat_file.read_text())
+            hb_ts = datetime.fromisoformat(hb["ts"])
+            if datetime.now(timezone.utc) - hb_ts > timedelta(minutes=25):
+                lines.insert(1, f"⚠️ *BOT MAY BE DOWN* — last heartbeat: {hb_ts.strftime('%H:%M UTC')} (>{25}min ago)")
+        except Exception:
+            pass
+    else:
+        lines.insert(1, "⚠️ *No heartbeat file — bot has never completed a run*")
 
     return "\n".join(lines)
 

@@ -33,6 +33,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
@@ -52,6 +54,15 @@ CONFIG_FILE     = ROOT / "config" / "grid_params.json"
 REGIME_FILE     = ROOT / "data"   / "regime.json"
 GRID_STATE_FILE = ROOT / "data"   / "grid_state.json"
 LOCK_FILE       = ROOT / "data"   / "grid_trader.lock"
+HEARTBEAT_FILE  = ROOT / "data"   / "last_heartbeat.json"
+
+SAFE_BOUNDS = {
+    "spacing_pct": (0.55, 3.0),
+    "range_pct":   (2.0,  15.0),
+    "levels":      (4,    20),
+    "capital_pct": (0.40, 0.80),
+    "kill_pct":    (0.05, 0.15),
+}
 
 INSTRUMENT = "BTC_USDT"
 
@@ -84,17 +95,30 @@ def release_lock() -> None:
 
 def load_config() -> dict:
     if CONFIG_FILE.exists():
-        return json.loads(CONFIG_FILE.read_text())
-    # Default safe config — override via config/grid_params.json
-    return {
-        "instrument":    "BTC_USDT",
-        "spacing_pct":   0.8,
-        "range_pct":     5.0,
-        "levels":        10,
-        "capital_pct":   0.70,
-        "total_capital": float(os.environ.get("TOTAL_CAPITAL_GBP", "150")),
-        "gbp_usd_rate":  float(os.environ.get("GBP_USD_RATE", "1.27")),
-    }
+        config = json.loads(CONFIG_FILE.read_text())
+    else:
+        config = {
+            "instrument":    "BTC_USDT",
+            "spacing_pct":   0.8,
+            "range_pct":     5.0,
+            "levels":        10,
+            "capital_pct":   0.70,
+            "total_capital": float(os.environ.get("TOTAL_CAPITAL_GBP", "150")),
+            "gbp_usd_rate":  float(os.environ.get("GBP_USD_RATE", "1.27")),
+        }
+    violations = []
+    for key, (lo, hi) in SAFE_BOUNDS.items():
+        val = config.get(key)
+        if val is None:
+            violations.append(f"{key} missing")
+        elif not (lo <= val <= hi):
+            violations.append(f"{key}={val} outside [{lo}, {hi}]")
+    if violations:
+        msg = "[grid] UNSAFE CONFIG — refusing to trade: " + "; ".join(violations)
+        print(msg)
+        _send_telegram_alert(msg)
+        sys.exit(1)
+    return config
 
 
 def load_grid_state() -> dict:
@@ -118,6 +142,29 @@ def load_regime() -> dict:
         except json.JSONDecodeError:
             pass
     return {"regime": "ranging"}
+
+
+# ------------------------------------------------------------------ #
+#  Helpers                                                             #
+# ------------------------------------------------------------------ #
+
+MIN_QTY_BTC = 0.0001  # crypto.com minimum order size
+
+
+def _send_telegram_alert(message: str) -> None:
+    """Fire-and-forget Telegram alert. Used for critical config errors."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        httpx.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"},
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ #
@@ -147,7 +194,10 @@ def build_grid(center_price: float, config: dict) -> list[dict]:
         offset = (i - half) * spacing_pct
         price  = center_price * (1 + offset)
         side   = "SELL" if i >= half else "BUY"
-        qty    = per_level_usdt / price
+        qty = per_level_usdt / price
+        if qty < MIN_QTY_BTC:
+            print(f"[grid] Level {i}: qty {qty:.8f} BTC below minimum {MIN_QTY_BTC} — flooring")
+            qty = MIN_QTY_BTC
         result.append({
             "level": i,
             "price": round(price, 2),
@@ -184,7 +234,7 @@ def place_grid(cdx: CDXClient, levels: list[dict], grid_state: dict) -> None:
             }
             print(f"[grid] Placed {lvl['side']} {lvl['qty']:.6f} BTC @ {lvl['price']:.2f} "
                   f"(level {idx})")
-        except CDXError as e:
+        except (CDXError, Exception) as e:
             print(f"[grid] Failed to place level {idx}: {e}")
 
 
@@ -203,7 +253,11 @@ def detect_fills(
     Cross-reference open orders with order history.
     For each filled order: log it, update risk, schedule replacement.
     """
-    history  = cdx.get_order_history(INSTRUMENT, limit=50)
+    try:
+        history = cdx.get_order_history(INSTRUMENT, limit=50)
+    except Exception as e:
+        print(f"[grid] Failed to fetch order history: {e} — skipping fill detection")
+        return
     filled   = {o["order_id"]: o for o in history if o.get("status") == "FILLED"}
 
     week_start = risk_state.get("week_start", "")
@@ -256,7 +310,7 @@ def needs_recalibration(current_price: float, grid_state: dict, config: dict) ->
     centre, meaning the grid band needs recentering.
     """
     cal_price = grid_state.get("calibration_price")
-    if cal_price is None:
+    if cal_price is None or cal_price <= 0:
         return True
     move_pct = abs(current_price - cal_price) / cal_price * 100
     return move_pct > 3.0
@@ -302,7 +356,7 @@ def _run() -> None:
     # 2. Current price
     try:
         ticker = cdx.get_ticker(INSTRUMENT)
-    except CDXError as e:
+    except (CDXError, httpx.TimeoutException, Exception) as e:
         print(f"[grid] get_ticker failed: {e} — aborting run.")
         return
 
@@ -332,6 +386,14 @@ def _run() -> None:
     # 6. Save state
     grid_state["last_run"] = datetime.now(timezone.utc).isoformat()
     save_grid_state(grid_state)
+
+    # 7. Heartbeat — lets daily_reporter detect if the bot has silently stopped
+    HEARTBEAT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT_FILE.write_text(json.dumps({
+        "ts":       datetime.now(timezone.utc).isoformat(),
+        "price":    price,
+        "week_pnl": risk_state.get("weekly_pnl_gbp", 0),
+    }))
 
     print(f"[grid] Run complete. Week P&L: £{risk_state.get('weekly_pnl_gbp', 0):.2f}")
 

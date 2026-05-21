@@ -43,10 +43,36 @@ GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.
 #  Performance metrics                                                 #
 # ------------------------------------------------------------------ #
 
+SAFE_BOUNDS = {
+    "spacing_pct": (0.55, 3.0),
+    "range_pct":   (2.0,  15.0),
+    "levels":      (4,    20),
+    "capital_pct": (0.40, 0.80),
+    "kill_pct":    (0.05, 0.15),
+}
+
+
+def validate_params(proposed: dict) -> list[str]:
+    """Return a list of violation strings; empty list means params are safe."""
+    violations = []
+    for key, (lo, hi) in SAFE_BOUNDS.items():
+        val = proposed.get(key)
+        if val is None:
+            violations.append(f"{key} missing")
+        elif not (lo <= val <= hi):
+            violations.append(f"{key}={val} outside [{lo}, {hi}]")
+    return violations
+
+
 def compute_metrics(trades: list[dict]) -> dict:
     sells = [t for t in trades if t["side"] == "SELL"]
     if not sells:
-        return {"error": "no_sells"}
+        return {
+            "trades_total": len(trades), "sells": 0, "win_rate_pct": 0,
+            "avg_net_gbp": 0, "total_net_gbp": 0, "fee_drag_pct": 0,
+            "sharpe": 0, "max_loss_gbp": 0, "avg_win_gbp": 0,
+            "note": "no_sells_this_week",
+        }
 
     nets     = [t["net_gbp"] for t in sells]
     wins     = [n for n in nets if n > 0]
@@ -237,6 +263,14 @@ def run() -> None:
         return
 
     rationale = proposed.pop("rationale", "No rationale provided.")
+
+    # Safety gate — reject any params outside hard bounds before walk-forward
+    violations = validate_params(proposed)
+    if violations:
+        msg = "⚠️ *Gemini proposed unsafe params — rejected*\n" + "\n".join(violations)
+        send_telegram(msg)
+        print(f"[optimiser] Unsafe proposal rejected: {violations}")
+        return
 
     # Walk-forward validation
     accepted, curr_ret, prop_ret = walk_forward_confirms(candles, current_config, proposed)
