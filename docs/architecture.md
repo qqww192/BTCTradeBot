@@ -3,61 +3,96 @@
 ## System Overview
 
 ```
-GitHub Actions (cron scheduler)
+Oracle Cloud VM  (Ubuntu 22.04 ARM, crontab-driven)
         │
-        ▼
-   src/main.py  ◄── orchestrates the three stages
+        ├─ every 5 min ──► grid_trader.py   ← main bot loop
+        │                       │
+        │              ┌────────┴─────────┐
+        │              ▼                  ▼
+        │       cdx_client.py       risk_manager.py
+        │    (crypto.com API)     (kill switch + P&L)
+        │              │                  │
+        │       trade_logger.py    data/weekly_state.json
+        │       data/trades.json
         │
-        ├─► src/fetch_portfolio.py
-        │         │
-        │         └─► Trading 212 REST API (paginated)
-        │                   │
-        │             list[Position]
+        ├─ every 4 hrs ──► regime_classifier.py
+        │                       │
+        │               cdx_client.py  (30 daily candles)
+        │                       │
+        │               data/regime.json
         │
-        ├─► src/analyse.py
-        │         │
-        │         └─► Anthropic API (claude-sonnet-4)
-        │                   │   (+ web_search tool for live news)
-        │             Markdown report string
+        ├─ daily 08:00 ──► daily_reporter.py
+        │                       │
+        │               data/trades.json + weekly_state.json
+        │                       │
+        │               Telegram message
         │
-        └─► src/report.py
-                  │
-                  └─► Google Docs API
-                            │
-                      Appended to master Google Doc
+        └─ Sunday 23:00 ──► gemini_optimizer.py
+                                │
+                        data/trades.json (last 7 days)
+                        cdx_client.py    (30 daily candles)
+                                │
+                        Gemini 1.5 Flash API (walk-forward validated)
+                                │
+                        config/grid_params.json  ← only updated if improved
 ```
 
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Scheduler | GitHub Actions | Free, cloud-hosted, no VPS required; runs when laptop is closed |
-| HTTP client | `httpx` | Modern sync/async, better than `requests` for type hints |
-| T212 pagination | Cursor-based | T212's documented pattern; avoids missed records on large portfolios |
-| Report storage | Google Doc (append) | Persistent log of every run; easy to share; no extra DB needed |
-| Auth (Google) | Service Account | Headless / non-interactive — works in CI without OAuth browser flow |
-| Analysis model | claude-sonnet-4 | Best balance of speed and analytical depth for this use case |
-| Web search in analysis | Enabled via tool | Allows Claude to fetch live news per ticker rather than relying on training data |
+| Scheduler | Oracle VM crontab | Always-on, low-latency, free tier |
+| All orders | `POST_ONLY` limit | Maker fee 0.25% vs taker 0.40%; profitable at 0.8% spacing |
+| State persistence | JSON files | Simple, inspectable, easy to back up with `git` |
+| Kill switch | Automatic, weekly reset | Hard stop at −10% weekly loss; resets Monday 00:00 UTC |
+| Regime detection | ATR-14 + Bollinger Band Width | Low complexity, well-understood, works on 4-hour cadence |
+| AI optimisation | Gemini 1.5 Flash + walk-forward | Sunday review only; walk-forward guard prevents overfitting |
+| Capital reserve | ≥20% always | `capital_pct` capped at 0.80; buffer covers open BUY exposure |
+| Concurrency guard | PID lock file | Prevents overlapping cron runs on slow API calls |
 
-## Data Flow
+## Data Flow — 5-Minute Loop
 
-1. **Fetch**: `fetch_portfolio.py` calls `GET /equity/portfolio` with `limit=50` and follows `nextCursor` until exhausted. Returns a list of position dicts (ticker, quantity, average price, current price, P&L).
+1. **Lock** — write PID to `data/grid_trader.lock`; exit if lock already held
+2. **Kill switch check** — read `data/weekly_state.json`; halt if active
+3. **Load state** — `config/grid_params.json` + `data/regime.json` + `data/grid_state.json`
+4. **Fetch price** — `GET /public/get-ticker` via `cdx_client.py`
+5. **Detect fills** — diff open orders vs order history; log to `data/trades.json`
+6. **Risk update** — `risk_manager.record_trade()` on each SELL fill; may trigger kill switch
+7. **Recalibrate** — cancel all + reset grid if price moved >3% from last calibration
+8. **Place grid** — `POST_ONLY` limit orders at each level not already occupied
+9. **Save state** — write `data/grid_state.json`
+10. **Unlock** — remove `data/grid_trader.lock`
 
-2. **Analyse**: `analyse.py` formats positions as a Markdown table, constructs a structured prompt, and sends it to Claude with the `web_search` tool enabled. Claude may make several web search calls before returning the final text response. All `type: "text"` blocks are concatenated into the report string.
+## Grid Maths
 
-3. **Report**: `report.py` authenticates via service account, finds or creates the master Google Doc, and appends the new report with a horizontal divider at the end of the document's body.
+```
+levels          = config["levels"]          # e.g. 10
+spacing_pct     = config["spacing_pct"]     # e.g. 0.8%
+capital_usdt    = total_capital_gbp * capital_pct * gbp_usd_rate
+per_level_usdt  = capital_usdt / levels
 
-## External Dependencies
+for i in range(levels):
+    offset = (i - levels//2) * spacing_pct/100
+    price  = center_price * (1 + offset)
+    side   = SELL if i >= levels//2 else BUY
+    qty    = per_level_usdt / price
+```
 
-| Service | Purpose | Criticality |
-|---|---|---|
-| Trading 212 API | Source of portfolio data | High — no fallback |
-| Anthropic API | Portfolio analysis | High — no fallback |
-| Google Docs API | Report delivery | Medium — report is logged to stdout even if Drive write fails |
+## File Map
 
-## Known Limitations
-
-- **T212 rate limits**: The API enforces rate limits (undocumented but roughly 1 req/sec). The current implementation is single-threaded and slow enough not to trigger them.
-- **No historical price data**: Claude analyses based on current prices only; no charting or time-series analysis.
-- **Google Doc size**: After many months of weekly runs, the doc will grow large. Consider archiving to a new doc annually.
-- **UTC timing**: GitHub Actions cron runs in UTC — adjust your cron expression for your local timezone.
+| Path | Purpose |
+|---|---|
+| `src/trading/cdx_client.py` | crypto.com Exchange REST client; HMAC-SHA256 auth |
+| `src/trading/grid_trader.py` | 5-min orchestrator; single entry point |
+| `src/trading/risk_manager.py` | Kill switch guardian; weekly P&L accounting |
+| `src/trading/regime_classifier.py` | ATR + BBW market regime; writes `data/regime.json` |
+| `src/trading/gemini_optimizer.py` | Sunday AI review; updates `config/grid_params.json` |
+| `src/trading/daily_reporter.py` | 08:00 UTC Telegram report |
+| `src/trading/trade_logger.py` | Append-only JSON fill ledger |
+| `config/grid_params.json` | Live grid parameters (committed; VM pulls nightly) |
+| `data/weekly_state.json` | Weekly P&L + kill switch flag (runtime; not committed) |
+| `data/trades.json` | Append-only trade ledger (runtime; not committed) |
+| `data/grid_state.json` | Active order IDs + calibration price (runtime) |
+| `data/regime.json` | Current market regime + indicator values (runtime) |
+| `oracle_setup/setup.sh` | One-time Oracle VM setup script |
+| `oracle_setup/crontab.template` | Cron job definitions with path placeholders |
