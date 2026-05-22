@@ -70,6 +70,10 @@ if [ ! -f "$BOT_DIR/.env" ]; then
     exit 1
 fi
 
+# Strip Windows CRLF line endings that break env var parsing
+sed -i 's/\r$//' "$BOT_DIR/.env"
+echo "      Stripped CRLF from .env (safe no-op if already Unix format)"
+
 # ---- 6. Create data directories ----
 echo "[6/7] Creating data directories..."
 mkdir -p "$BOT_DIR/data"

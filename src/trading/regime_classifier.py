@@ -143,8 +143,11 @@ def run() -> None:
         print("Not enough candle data — skipping regime update.")
         return
 
-    atr     = compute_atr(candles)
-    bbw     = compute_bbw(candles)
+    atr = compute_atr(candles)
+    bbw = compute_bbw(candles)
+    if math.isnan(atr) or math.isnan(bbw):
+        print(f"[regime] Insufficient candle data (atr={atr}, bbw={bbw}) — skipping update")
+        return
     regime  = classify(atr, bbw, candles)
     params  = REGIME_PARAMS[regime]
 

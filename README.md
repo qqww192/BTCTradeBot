@@ -1,54 +1,46 @@
-# T212 Portfolio Checker
+# BTC/USDT Grid Trading Bot
 
-Automated pipeline that fetches your Trading 212 portfolio, analyses it with Google Gemini, and delivers:
-
-- **Weekly report** → Google Drive (Google Doc, append-only log)
-- **Daily news alerts** → Telegram (Tier 1 events only: rate surprises, crashes, fund incidents)
-
-Runs entirely on **GitHub Actions** — no server or local machine required.
+Adaptive spot grid trader for crypto.com Exchange running on an Oracle Cloud Always Free ARM VM.
 
 ## How it works
 
 ```
-GitHub Actions (cron)
-    │
-    ├─► Trading 212 API  ──► portfolio positions
-    │
-    ├─► Gemini API (with Search grounding)  ──► analysis / news scan
-    │
-    ├─► Google Docs API  ──► weekly report + daily audit log
-    │
-    └─► Telegram Bot API  ──► Tier 1 alerts only
+Oracle Cloud VM (cron scheduler)
+        │
+        ├─► every 5 min  → src/trading/grid_trader.py
+        │                     fill detection → risk check → order placement
+        │
+        ├─► every 4 hrs  → src/trading/regime_classifier.py
+        │                     ATR-14 + Bollinger Band Width → data/regime.json
+        │
+        ├─► daily 08:00  → src/trading/daily_reporter.py
+        │                     P&L summary → Telegram
+        │
+        └─► Sunday 23:00 → src/trading/gemini_optimizer.py
+                              Gemini AI review → config/grid_params.json
 ```
 
 ## Setup
 
-See **[docs/setup.md](docs/setup.md)** for the full step-by-step guide.
+See **[oracle_deployment.md](oracle_deployment.md)** for the full step-by-step VM provisioning and deployment guide.
 
-**Secrets required in GitHub Actions:**
+**Secrets required in `.env` on the Oracle VM:**
 
-| Secret | Source |
+| Variable | Description |
 |---|---|
-| `T212_API_KEY` | Trading 212 → Settings → API |
-| `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com) → Get API Key |
-| `GOOGLE_SA_JSON` | Google Cloud → Service Account → JSON key |
-| `GOOGLE_DOC_ID` | Google Doc URL (set after first run) |
+| `CDX_API_KEY` | crypto.com Exchange API key (Trade permission only) |
+| `CDX_API_SECRET` | crypto.com Exchange API secret |
+| `GEMINI_API_KEY` | Google AI Studio → Get API Key |
 | `TELEGRAM_BOT_TOKEN` | Telegram → @BotFather → /newbot |
 | `TELEGRAM_CHAT_ID` | Telegram → @userinfobot |
+| `TOTAL_CAPITAL_GBP` | Total capital deployed (default: 150) |
+| `GBP_USD_RATE` | GBP/USD rate for P&L conversion (default: 1.27) |
+| `KILL_SWITCH_PCT` | Weekly loss limit as fraction of capital (default: 0.10) |
 
-## Schedules
+## Key constraints
 
-| Job | Default schedule | File |
-|---|---|---|
-| Weekly portfolio report | Every Monday 07:00 UTC | `.github/workflows/schedule.yml` |
-| Daily news alert | Mon–Fri 07:00 UTC | `.github/workflows/daily-alert.yml` |
-
-Both schedules are a single cron expression — edit to suit your timezone.
-
-## Alert tiers
-
-| Tier | Score | Action |
-|---|---|---|
-| 🔴 Tier 1 | 8–10 | Telegram alert sent immediately |
-| 🟡 Tier 2 | 5–7 | Logged to Google Doc, surfaces in weekly report |
-| ⚪ Tier 3 | 1–4 | Briefly logged, no further action |
+- All orders are `POST_ONLY` limit orders — no market orders, ever
+- Maximum `capital_pct`: 0.80 (keep ≥20% as reserve)
+- Weekly kill switch at −10% of total capital; auto-resets Monday 00:00 UTC
+- Spot only — no leverage, no margin, no derivatives
+- API key has Trade permission but NOT withdrawal permission
