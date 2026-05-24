@@ -72,7 +72,7 @@ def format_report() -> str:
     date_str = (now.replace(hour=0) - __import__("datetime").timedelta(days=1)).strftime("%a %d %b %Y")
 
     lines = [
-        f"📊 *FinancialAdvisor — Daily Trade Report*",
+        f"📊 *BTCTradeBot — Daily Trade Report*",
         f"_{date_str} · BTC/USDT Grid_",
         f"",
         f"━━━━━━━━━━━━━━━━━━━━━",

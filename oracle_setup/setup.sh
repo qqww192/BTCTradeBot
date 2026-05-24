@@ -60,7 +60,7 @@ if [ ! -f "$BOT_DIR/.env" ]; then
     echo "  Reference: .env.example in the repo."
     echo ""
     echo "  Quick copy from local machine:"
-    echo "    scp .env ubuntu@<YOUR_VM_IP>:~/FinancialAdvisor/.env"
+    echo "    scp .env ubuntu@<YOUR_VM_IP>:~/BTCTradeBot/.env"
     echo ""
     read -p "  Press Enter once .env is in place, or Ctrl+C to abort..." _
 fi

@@ -1,16 +1,20 @@
-# FinancialAdvisor — Claude Code Context
+# BTCTradeBot — Claude Code Context
+
+## Owner & portfolio context
+- **John** — low-risk trader, prefers high success rate over high returns
+- **Algo capital:** £150 BTC on crypto.com — the only money this bot controls
 
 ## Project overview
 Automated BTC/USDT grid trading bot for John's crypto.com account.
 
 **Grid Trading Bot** — adaptive BTC/USDT spot grid trader on crypto.com Exchange.
-Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04).
+Runs continuously on an Oracle Cloud Always Free ARM VM (Ubuntu 22.04, UK Cardiff region).
 
 ## Stack
 - Language: Python 3.11
 - Key libs: `httpx`, `python-dotenv`, `google-generativeai`
-- AI: Google Gemini 1.5 Flash (weekly optimisation + search grounding)
-- Infrastructure: Oracle Cloud Always Free ARM VM (Ubuntu 22.04)
+- AI: Groq (Qwen3-32B) primary + Cerebras (gpt-oss-120b) fallback — weekly optimisation
+- Infrastructure: Oracle Cloud Always Free ARM VM (Ubuntu 22.04, **UK Cardiff**)
 - Delivery: Telegram bot
 - Secrets: `.env` file on the Oracle VM — never committed to git
 
@@ -76,10 +80,10 @@ See `docs/architecture.md`. Key points:
 - Warning threshold: -5% of total capital (£7.50)
 - Grid recentres when BTC moves >3% from last calibration price
 - Regime reclassification: every 4 hours via ATR-14 + Bollinger Band Width
-- **Minimum capital:** `0.0001 BTC × BTC_price × levels ÷ capital_pct ÷ gbp_usd_rate`
-  - At BTC $105k / 10 levels / 70%: **£118 minimum** (default config)
-  - Starter option: 4 levels → **£50 minimum** (set `"levels": 4` in grid_params.json)
-  - £15 is **not viable** — per-level qty falls 13× below crypto.com's 0.0001 BTC minimum
+- **Capital viability at £150 with 6 levels:**
+  - Safe up to BTC ~$224,000 (minimum capital formula: `0.0001 × BTC_price × levels ÷ capital_pct ÷ gbp_usd_rate`)
+  - If BTC approaches $200k → drop to 5 levels or top up to £200
+  - Bot enforces this at runtime and sends Telegram alert if breached
 
 ## Self-learning loop
 - **Inner loop (every 5 min):** fill detection → risk check → order placement
@@ -91,3 +95,12 @@ See `docs/architecture.md`. Key points:
 - The Oracle VM runs `git pull --ff-only` daily at 01:00 UTC to pick up config changes
 - Never push directly to `main`
 - Commit `config/grid_params.json` after every manual param change so the VM picks it up
+
+## Parked work — do not implement without discussion
+- **Prediction markets module** (`src/trading/betfair_client.py` exists as a draft)
+  - Polymarket: blocked — Oracle VM is in UK Cardiff, geo-blocked by Polymarket
+  - Betfair: blocked — £299 live API activation fee, prohibitive for £150 capital
+  - Matchbook: viable (free API, UK-regulated) but primarily sports markets
+  - Smarkets: viable (£150 refundable deposit) but not yet decided
+  - Decision: revisit when BTC grid is consistently profitable and capital grows
+- **CFDs** — assessed and rejected; leverage risk incompatible with low-risk profile

@@ -1,2 +1,35 @@
+# Core HTTP + env
 httpx==0.27.0
 python-dotenv==1.0.1
+
+# Skill 1: CCXT — replaces hand-rolled cdx_client.py
+ccxt>=4.3.0
+
+# Skill 2: HMM regime detection — replaces static ATR/BBW thresholds
+hmmlearn>=0.3.2
+numpy>=1.26.0
+scikit-learn>=1.4.0
+
+# Skill 3: aiogram v3 — interactive Telegram controller
+aiogram>=3.4.1
+
+# Skill 4: Dynamic CDaR-based capital sizing
+riskfolio-lib>=7.2.1
+
+# Skill 5: Optuna — Bayesian grid parameter optimisation
+optuna>=4.0.0
+
+# Skill 6: Prometheus metrics (textfile for cron-based processes)
+prometheus-client>=0.20.0
+
+# Skill 8: CCXT Pro WebSocket (event-driven fill detection)
+# Included in ccxt package above; enable Pro tier separately on the VM.
+
+# Skill 9: FinRL DRL (optional — heavy, requires separate install step)
+# finrl>=3.0.0
+# stable-baselines3>=2.0.0
+# torch>=2.1.0
+
+# AI optimiser providers (weekly grid param review — both free tier, no card needed)
+# Primary: Groq (Qwen3-32B). Fallback: Cerebras (gpt-oss-120b).
+# Both use OpenAI-compatible API — no extra library needed, httpx handles the calls.

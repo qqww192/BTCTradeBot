@@ -1,5 +1,7 @@
 """
-Gemini AI weekly optimiser — runs Sunday 23:00 UTC via crontab.
+AI weekly optimiser — runs Sunday 23:00 UTC via crontab.
+Uses Groq (Qwen3-32B) as primary AI provider, Cerebras (gpt-oss-120b) as fallback.
+Both are free tiers, no credit card required, UK-accessible.
 
 Steps
 -----
@@ -34,9 +36,25 @@ sys.path.insert(0, str(ROOT / "src"))
 from trading.trade_logger  import read_all, read_since
 from trading.cdx_client    import CDXClient, CDXError
 
-CONFIG_FILE = ROOT / "config" / "grid_params.json"
-REGIME_FILE = ROOT / "data"   / "regime.json"
-GEMINI_URL  = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+CONFIG_FILE      = ROOT / "config" / "grid_params.json"
+REGIME_FILE      = ROOT / "data"   / "regime.json"
+CANDIDATES_FILE  = ROOT / "data"   / "optuna_candidates.json"  # Skill 5
+
+# AI providers — tried in order until one succeeds
+_PROVIDERS = [
+    {
+        "name":    "Groq",
+        "url":     "https://api.groq.com/openai/v1/chat/completions",
+        "model":   "qwen/qwen3-32b",
+        "env_key": "GROQ_API_KEY",
+    },
+    {
+        "name":    "Cerebras",
+        "url":     "https://api.cerebras.ai/v1/chat/completions",
+        "model":   "gpt-oss-120b",
+        "env_key": "CEREBRAS_API_KEY",
+    },
+]
 
 
 # ------------------------------------------------------------------ #
@@ -103,67 +121,213 @@ def compute_metrics(trades: list[dict]) -> dict:
 #  Gemini call                                                         #
 # ------------------------------------------------------------------ #
 
-def ask_gemini(metrics_7d: dict, current_config: dict, regime: str) -> dict | None:
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        print("[optimiser] GEMINI_API_KEY not set — skipping AI review.")
-        return None
+def _load_optuna_candidates() -> list[dict]:
+    """Load Optuna top-3 candidates produced by optuna_optimizer.py (Skill 5)."""
+    if not CANDIDATES_FILE.exists():
+        return []
+    try:
+        data = json.loads(CANDIDATES_FILE.read_text())
+        candidates = data.get("candidates", [])
+        print(f"[optimiser] Loaded {len(candidates)} Optuna candidates from Saturday sweep")
+        return candidates
+    except Exception:
+        return []
 
-    prompt = f"""
-You are a conservative crypto trading bot optimiser.
-The bot uses a spot grid strategy on BTC/USDT on crypto.com Exchange.
-It has a £150 total capital pool and a 10% weekly kill switch.
 
-Current grid parameters:
+def _build_prompt(
+    metrics_7d: dict,
+    current_config: dict,
+    regime: str,
+    btc_price_usdt: float,
+    candidates: list | None = None,
+    agent_role: str = "conservative crypto trading bot optimiser",
+    agent_stance: str = "",
+) -> str:
+    total_capital = current_config.get("total_capital", 150)
+    gbp_usd       = current_config.get("gbp_usd_rate", 1.27)
+    max_min_cap   = total_capital * 0.85
+
+    btc_price_note = (
+        f"Current BTC price ≈ ${btc_price_usdt:,.0f} USDT.\n"
+        f"Minimum capital formula: 0.0001 × BTC_price × levels / capital_pct / gbp_usd_rate\n"
+        f"Proposed params must keep this below £{max_min_cap:.0f} (total capital £{total_capital}).\n"
+        if btc_price_usdt > 0 else ""
+    )
+
+    # Inject Optuna candidates when available (Skill 5)
+    candidates_text = ""
+    if candidates:
+        candidates_text = (
+            "\n\nOptuna pre-validated top candidates (Bayesian sweep, 30-day data):\n"
+            + json.dumps(candidates, indent=2)
+            + "\n\nPREFER to select from these — only deviate if there is a strong analytical reason.\n"
+        )
+
+    stance_text = f"\nYour analytical stance: {agent_stance}\n" if agent_stance else ""
+
+    return f"""You are a {agent_role}.
+The bot runs a spot BTC/USDT grid strategy on crypto.com Exchange.
+Total capital: £{total_capital}. Weekly kill switch: 10%.
+{stance_text}
+{btc_price_note}
+Current parameters:
 {json.dumps(current_config, indent=2)}
 
-Current market regime: {regime}
+Market regime: {regime}
 
-Last 7 days performance metrics:
+Last 7 days metrics:
 {json.dumps(metrics_7d, indent=2)}
+{candidates_text}
+Propose grid parameters for next week. Rules:
+- Prioritise capital preservation over returns.
+- Do NOT chase last week — optimise for 30-day robustness.
+- Keep changes minimal if win_rate > 60% and fee_drag < 30%.
+- Tighten kill_pct if regime is trending_dn.
+- spacing_pct > 0.55 (must beat 0.25% maker fee × 2).
+- levels: 4–20. capital_pct: 0.50–0.80. range_pct: 3.0–10.0.
 
-Your task: propose new grid parameters for next week.
+Return ONLY valid JSON, no markdown, no extra text:
+{{"instrument":"BTC_USDT","spacing_pct":<float>,"range_pct":<float>,"levels":<int>,"capital_pct":<float>,"total_capital":{total_capital},"gbp_usd_rate":{gbp_usd},"kill_pct":<float>,"rationale":"<one sentence>"}}"""
 
-Rules you must follow:
-- Prioritise capital preservation over return maximisation.
-- Do NOT chase last week's results — think about what is robust over 30 days.
-- If the current params are already performing well (win_rate > 60%, fee_drag < 30%), 
-  keep changes minimal or return the same params.
-- Tighten the kill switch threshold (kill_pct) if trending_dn regime.
-- spacing_pct must always be > 0.55 (minimum to beat 0.25% maker fee × 2).
-- levels must be between 6 and 16.
-- capital_pct must be between 0.50 and 0.80.
-- range_pct must be between 3.0 and 10.0.
 
-Return ONLY a valid JSON object with these exact keys:
-{{
-  "instrument":   "BTC_USDT",
-  "spacing_pct":  <float>,
-  "range_pct":    <float>,
-  "levels":       <int>,
-  "capital_pct":  <float>,
-  "total_capital": {current_config.get("total_capital", 150)},
-  "gbp_usd_rate": {current_config.get("gbp_usd_rate", 1.27)},
-  "kill_pct":     <float>,
-  "rationale":    "<one sentence>"
-}}
-No other text. No markdown. No code blocks. Pure JSON only.
-"""
+def _raw_ai_call(prompt: str) -> str | None:
+    """Try each provider in order; return raw response text on first success."""
+    for provider in _PROVIDERS:
+        api_key = os.environ.get(provider["env_key"], "")
+        if not api_key:
+            continue
+        try:
+            resp = httpx.post(
+                provider["url"],
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model":           provider["model"],
+                    "messages":        [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                    "temperature":     0.3,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"].strip()
+            return text.replace("```json", "").replace("```", "").strip()
+        except Exception as exc:
+            print(f"[optimiser] {provider['name']} failed: {exc}")
+    return None
 
-    try:
-        resp = httpx.post(
-            f"{GEMINI_URL}?key={api_key}",
-            json={"contents": [{"parts": [{"text": prompt}]}]},
-            timeout=30,
+
+def _multi_agent_debate(
+    metrics_7d:     dict,
+    current_config: dict,
+    regime:         str,
+    btc_price_usdt: float,
+    candidates:     list,
+) -> dict | None:
+    """
+    Skill 10: Run three specialist agents then synthesise consensus.
+
+    Agents:
+      1. Bullish analyst  — maximise fill frequency + return
+      2. Bearish analyst  — minimise drawdown + fee drag
+      3. Risk manager     — balance return vs kill-switch distance
+
+    The synthesiser picks the single best set from the three proposals.
+    Falls back to single-agent if two or more agents fail.
+    """
+    agent_configs = [
+        ("Bullish Grid Analyst",
+         "Maximise trade frequency and weekly return. Prefer tighter spacing and more levels."),
+        ("Bearish Grid Analyst",
+         "Minimise drawdown and fee drag. Prefer wider spacing and lower capital_pct."),
+        ("Grid Risk Manager",
+         "Balance return against kill-switch distance. Prioritise capital preservation."),
+    ]
+
+    proposals = []
+    for role, stance in agent_configs:
+        print(f"[optimiser] {role}...")
+        prompt = _build_prompt(
+            metrics_7d, current_config, regime, btc_price_usdt,
+            candidates=candidates, agent_role=role, agent_stance=stance,
         )
-        resp.raise_for_status()
-        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Strip accidental markdown fences
-        text = text.replace("```json", "").replace("```", "").strip()
-        return json.loads(text)
-    except Exception as e:
-        print(f"[optimiser] Gemini call failed: {e}")
+        raw = _raw_ai_call(prompt)
+        if not raw:
+            continue
+        try:
+            prop = json.loads(raw)
+            proposals.append({"agent": role, "proposal": prop})
+            print(f"[optimiser]   → spacing={prop.get('spacing_pct')} levels={prop.get('levels')} "
+                  f"capital={prop.get('capital_pct')}")
+        except Exception as e:
+            print(f"[optimiser]   {role} parse failed: {e}")
+
+    if not proposals:
         return None
+    if len(proposals) == 1:
+        return proposals[0]["proposal"]
+
+    # Synthesiser selects the consensus
+    total_capital = current_config.get("total_capital", 150)
+    gbp_usd       = current_config.get("gbp_usd_rate", 1.27)
+    synth_prompt  = f"""You are a senior quantitative risk officer for a BTC/USDT spot grid bot.
+Capital: £{total_capital}. Weekly kill switch: 10%. Regime: {regime}.
+7-day performance: {json.dumps(metrics_7d)}
+
+Three analysts proposed parameters:
+{json.dumps([p["proposal"] for p in proposals], indent=2)}
+
+Choose the single best set. Rules: spacing_pct > 0.55, levels 4–20, capital_pct 0.50–0.80.
+Prioritise capital preservation. Keep changes minimal if win_rate > 60% and fee_drag < 30%.
+
+Return ONLY valid JSON, no markdown:
+{{"instrument":"BTC_USDT","spacing_pct":<float>,"range_pct":<float>,"levels":<int>,"capital_pct":<float>,"total_capital":{total_capital},"gbp_usd_rate":{gbp_usd},"kill_pct":<float>,"rationale":"<one sentence>"}}"""
+
+    raw = _raw_ai_call(synth_prompt)
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[optimiser] Synthesiser parse failed: {e}")
+
+    # Fallback: return the Risk Manager's proposal
+    for p in proposals:
+        if "Risk" in p["agent"]:
+            return p["proposal"]
+    return proposals[-1]["proposal"]
+
+
+def ask_ai(
+    metrics_7d: dict,
+    current_config: dict,
+    regime: str,
+    btc_price_usdt: float = 0.0,
+    candidates: list | None = None,
+) -> dict | None:
+    """
+    Try multi-agent debate first; fall back to single-agent on failure.
+    Injects Optuna candidates (Skill 5) into every agent prompt.
+    """
+    candidates = candidates or []
+    # Multi-agent debate (Skill 10)
+    result = _multi_agent_debate(metrics_7d, current_config, regime, btc_price_usdt, candidates)
+    if result:
+        return result
+
+    # Single-agent fallback (original behaviour)
+    print("[optimiser] Multi-agent debate failed — falling back to single-agent call")
+    prompt = _build_prompt(
+        metrics_7d, current_config, regime, btc_price_usdt, candidates=candidates
+    )
+
+    raw = _raw_ai_call(prompt)
+    if raw:
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"[optimiser] Single-agent parse failed: {e}")
+
+    print("[optimiser] All AI providers failed — keeping current parameters.")
+    return None
 
 
 # ------------------------------------------------------------------ #
@@ -172,23 +336,54 @@ No other text. No markdown. No code blocks. Pure JSON only.
 
 def simulate_return(candles: list[dict], config: dict) -> float:
     """
-    Simplified walk-forward simulation.
-    Counts how many grid-spacing moves fit within each day's range,
-    applies fee, and returns the total estimated net return %.
+    Walk-forward simulation estimating net return % over the candle period.
+
+    Fixes vs the prior version:
+    - Uses per-level capital (not total deployed) as the unit of return
+    - Distinguishes ranging days (completed round trips) from trending days
+      (zero round trips + recalibration drag)
+    - Expresses the result as % of total deployed capital
     """
-    spacing_pct = config["spacing_pct"] / 100
-    fee_pct     = 0.0025   # 0.25% maker per leg × 2 legs per round trip
+    spacing_pct     = config["spacing_pct"] / 100
+    fee_pct         = 0.0025   # 0.25% maker per leg
+    levels          = config["levels"]
+    capital_usdt    = (
+        config.get("total_capital", 150)
+        * config.get("capital_pct", 0.70)
+        * config.get("gbp_usd_rate", 1.27)
+    )
+    per_level_usdt  = capital_usdt / levels if levels else 0
+    deployed_usdt   = capital_usdt
 
-    total_return = 0.0
+    total_usdt = 0.0
     for c in candles:
-        daily_range_pct = (c["high"] - c["low"]) / c["close"]
-        # Estimate fills per day = range / spacing, capped at levels / 2
-        fills = min(daily_range_pct / spacing_pct, config["levels"] / 2)
-        gross = fills * spacing_pct * config["capital_pct"]
-        fees  = fills * fee_pct     * 2
-        total_return += gross - fees
+        high  = c["high"]
+        low   = c["low"]
+        close = c["close"]
+        # Use open if available; fall back to midpoint of the day's range
+        open_p = c.get("open", (high + low) / 2)
 
-    return round(total_return * 100, 2)  # as percentage
+        daily_move_pct = abs(close - open_p) / open_p if open_p else 0
+        # A day is "ranging" when the directional move is small relative to spacing
+        is_ranging = daily_move_pct < (spacing_pct * 2)
+
+        if is_ranging:
+            daily_range_pct = (high - low) / close if close else 0
+            round_trips     = min(daily_range_pct / (spacing_pct * 2), levels / 2)
+            gross           = round_trips * per_level_usdt * spacing_pct
+            fees            = round_trips * per_level_usdt * fee_pct * 2
+        else:
+            # Trending day: assume no completed round trips; only recalibration drag
+            # (grid recentres every 3% move = fee drag per recalibration)
+            recal_count = math.floor(daily_move_pct / 0.03)
+            gross = 0.0
+            fees  = recal_count * per_level_usdt * fee_pct * 2
+
+        total_usdt += gross - fees
+
+    if deployed_usdt > 0:
+        return round(total_usdt / deployed_usdt * 100, 2)
+    return 0.0
 
 
 def walk_forward_confirms(
@@ -247,17 +442,25 @@ def run() -> None:
 
     print(f"[optimiser] 7-day metrics: {metrics}")
 
-    # Fetch 30 days of candles for walk-forward
+    # Fetch 30 days of candles for walk-forward + current price for capital check
     cdx     = CDXClient()
     candles = cdx.get_candlesticks("BTC_USDT", timeframe="1D", count=30)
+    try:
+        ticker    = cdx.get_ticker("BTC_USDT")
+        btc_price = float(ticker.get("a", ticker.get("last", 0)))
+    except Exception:
+        btc_price = 0.0
 
-    # Ask Gemini
-    proposed = ask_gemini(metrics, current_config, regime)
+    # Load Optuna pre-validated candidates (Skill 5)
+    candidates = _load_optuna_candidates()
+
+    # Multi-agent AI debate → consensus (Skill 10)
+    proposed = ask_ai(metrics, current_config, regime, btc_price_usdt=btc_price, candidates=candidates)
 
     if proposed is None:
         send_telegram(
             "🔄 *Weekly optimisation*\n"
-            "Gemini AI unavailable — keeping current parameters.\n"
+            "AI unavailable (all providers failed) — keeping current parameters.\n"
             f"7-day net P&L: £{metrics.get('total_net_gbp', 0):.2f}"
         )
         return
@@ -271,6 +474,26 @@ def run() -> None:
         send_telegram(msg)
         print(f"[optimiser] Unsafe proposal rejected: {violations}")
         return
+
+    # Capital headroom check — reject if proposed config requires too much minimum capital
+    if btc_price > 0:
+        min_cap = (
+            0.0001
+            * btc_price
+            * proposed.get("levels", 10)
+            / proposed.get("capital_pct", 0.70)
+            / proposed.get("gbp_usd_rate", 1.27)
+        )
+        total_cap = proposed.get("total_capital", 150)
+        if min_cap > total_cap * 0.90:
+            msg = (
+                f"⚠️ *Gemini proposed params rejected — capital headroom too thin*\n"
+                f"Proposed levels={proposed.get('levels')} requires £{min_cap:.0f} minimum "
+                f"(capital: £{total_cap}, limit: £{total_cap * 0.90:.0f})"
+            )
+            send_telegram(msg)
+            print(f"[optimiser] Capital headroom check failed: min_cap=£{min_cap:.0f}")
+            return
 
     # Walk-forward validation
     accepted, curr_ret, prop_ret = walk_forward_confirms(candles, current_config, proposed)
@@ -289,8 +512,9 @@ def run() -> None:
         action  = "⏸ Parameters unchanged (walk-forward did not confirm improvement)"
         details = f"Walk-forward: current {curr_ret:.2f}% vs proposed {prop_ret:.2f}%"
 
+    optuna_note = f" · Optuna {len(candidates)} candidates" if candidates else ""
     send_telegram(
-        f"🔄 *Weekly Gemini optimisation*\n"
+        f"🔄 *Weekly optimisation (multi-agent{optuna_note})*\n"
         f"{action}\n\n"
         f"_{rationale}_\n\n"
         f"{details}\n\n"

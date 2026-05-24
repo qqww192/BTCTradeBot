@@ -1,8 +1,6 @@
 """
-Risk manager — enforces the weekly kill switch and tracks P&L.
-
-State is stored in data/weekly_state.json.  This file is the single
-source of truth for whether the bot is allowed to trade this week.
+Risk manager — enforces the weekly kill switch, tracks P&L, and
+provides Skill 4: CDaR-based dynamic capital sizing.
 
 Kill switch logic
 -----------------
@@ -12,9 +10,18 @@ Kill switch logic
   - The state resets automatically on Monday 00:00 UTC.
   - A Telegram alert is sent when the switch triggers.
 
-The grid_trader calls `is_kill_switch_active()` at the start of
-every 5-minute run.  If it returns True, the run exits immediately
-after cancelling any remaining open orders.
+Skill 4: Dynamic capital sizing (Riskfolio-Lib / CDaR)
+--------------------------------------------------------
+  get_dynamic_capital_pct() reads the last 30 SELLs, computes
+  Conditional Drawdown at Risk (CDaR), and returns a stepped-down
+  capital_pct when drawdown is deepening — eliminating the cliff-edge
+  binary kill switch.
+
+  Steps:
+    CDaR < 30% of kill threshold  → full deployment (base_capital_pct)
+    CDaR 30–50%                   → base − 0.10
+    CDaR 50–80%                   → base − 0.15
+    CDaR > 80%                    → base − 0.30  (minimum 0.40)
 """
 
 import json
@@ -26,9 +33,12 @@ from typing import Optional
 ROOT       = Path(__file__).resolve().parents[2]
 STATE_FILE = ROOT / "data" / "weekly_state.json"
 
-# Capital in GBP — loaded from env so it's easy to change
 TOTAL_CAPITAL_GBP = float(os.environ.get("TOTAL_CAPITAL_GBP", "150"))
 
+
+# ------------------------------------------------------------------ #
+#  Weekly state helpers                                                #
+# ------------------------------------------------------------------ #
 
 def _monday_utc() -> datetime:
     """Return the most recent Monday 00:00:00 UTC."""
@@ -52,10 +62,6 @@ def _save(state: dict) -> None:
 
 
 def _reset_if_new_week(state: dict) -> dict:
-    """
-    If the stored week_start is before this Monday, reset the state.
-    This handles the automatic Monday reset without any cron job.
-    """
     monday = _monday_utc().isoformat()
     if state.get("week_start") != monday:
         state = {
@@ -81,16 +87,14 @@ def is_kill_switch_active() -> bool:
 
 def record_trade(net_pnl_gbp: float) -> dict:
     """
-    Add a completed trade's net P&L (after fees, in GBP) to the
-    weekly total and check whether the kill switch should fire.
-
-    Returns the updated state.
+    Add a completed trade's net P&L to the weekly total and check
+    whether the kill switch should fire. Returns the updated state.
     """
-    state               = get_state()
+    state                     = get_state()
     state["weekly_pnl_gbp"]   += net_pnl_gbp
     state["trades_this_week"] += 1
 
-    kill_pct      = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
+    kill_pct       = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
     kill_threshold = -(TOTAL_CAPITAL_GBP * kill_pct)
 
     if state["weekly_pnl_gbp"] <= kill_threshold and not state["kill_switch_on"]:
@@ -105,10 +109,7 @@ def record_trade(net_pnl_gbp: float) -> dict:
 
 
 def record_warning(state: dict) -> None:
-    """
-    Send a Telegram warning when P&L hits the 50%-of-kill threshold.
-    Called by grid_trader — does nothing if warning already sent this week.
-    """
+    """Send a Telegram warning when P&L hits the 50%-of-kill threshold."""
     if state.get("warning_sent"):
         return
     kill_pct       = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
@@ -123,6 +124,99 @@ def record_warning(state: dict) -> None:
         state["warning_sent"] = True
         _save(state)
 
+
+# ------------------------------------------------------------------ #
+#  Skill 4: CDaR-based dynamic capital sizing                          #
+# ------------------------------------------------------------------ #
+
+def _compute_cdar(net_returns: list[float], alpha: float = 0.95) -> float:
+    """
+    Conditional Drawdown at Risk at confidence level alpha (numpy fallback).
+
+    CDaR = average drawdown in the worst (1-alpha)% of observations.
+    """
+    if len(net_returns) < 5:
+        return 0.0
+    try:
+        import numpy as np
+        arr         = np.array(net_returns, dtype=float)
+        cumulative  = np.cumsum(arr)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdowns   = cumulative - running_max
+        threshold   = float(np.percentile(drawdowns, (1.0 - alpha) * 100))
+        tail        = drawdowns[drawdowns <= threshold]
+        return float(abs(tail.mean())) if len(tail) > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _try_riskfolio_cdar(net_returns: list[float]) -> Optional[float]:
+    """
+    Use Riskfolio-Lib's CDaR if installed — provides CVXPY-optimised
+    risk measures.  Returns None if riskfolio-lib is not available.
+    """
+    try:
+        import riskfolio as rp
+        import pandas as pd
+        import numpy as np
+        series = pd.Series(net_returns, name="asset")
+        w      = pd.Series([1.0], index=["asset"])
+        cdar   = rp.RiskFunctions.CDaR_Abs(
+            series.values.reshape(-1, 1), w.values, alpha=0.95
+        )
+        return float(cdar)
+    except Exception:
+        return None
+
+
+def get_dynamic_capital_pct(base_capital_pct: float = 0.70) -> float:
+    """
+    Return a CDaR-adjusted capital_pct.
+
+    Reads the last 30 SELL trades, computes Conditional Drawdown at Risk,
+    and scales down deployment before the binary kill switch fires —
+    giving the bot a softer landing.
+
+    Guaranteed to stay within [0.40, base_capital_pct].
+    """
+    try:
+        from trading.trade_logger import read_all
+        sells    = [t for t in read_all() if t.get("side") == "SELL"]
+        net_rets = [t["net_gbp"] for t in sells[-30:]]
+    except Exception:
+        return base_capital_pct
+
+    if len(net_rets) < 5:
+        return base_capital_pct
+
+    cdar = _try_riskfolio_cdar(net_rets)
+    if cdar is None:
+        cdar = _compute_cdar(net_rets)
+
+    kill_pct = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))
+    kill_abs = TOTAL_CAPITAL_GBP * kill_pct
+    ratio    = cdar / kill_abs if kill_abs else 0.0
+
+    if ratio > 0.80:
+        adjusted = max(0.40, base_capital_pct - 0.30)
+    elif ratio > 0.50:
+        adjusted = max(0.55, base_capital_pct - 0.15)
+    elif ratio > 0.30:
+        adjusted = max(0.60, base_capital_pct - 0.10)
+    else:
+        adjusted = base_capital_pct
+
+    if adjusted < base_capital_pct:
+        print(
+            f"[risk] CDaR={cdar:.3f} GBP ({ratio*100:.0f}% of kill threshold) "
+            f"→ capital_pct stepped down {base_capital_pct:.2f} → {adjusted:.2f}"
+        )
+    return adjusted
+
+
+# ------------------------------------------------------------------ #
+#  Telegram helpers                                                    #
+# ------------------------------------------------------------------ #
 
 def _send_kill_alert(state: dict) -> None:
     kill_pct = float(os.environ.get("KILL_SWITCH_PCT", "0.10"))

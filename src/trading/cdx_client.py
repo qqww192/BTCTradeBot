@@ -1,208 +1,200 @@
 """
-crypto.com Exchange v1 API client.
-Handles authentication, signing, and all REST calls the bot needs.
-Never import API keys directly — always read from environment variables.
+crypto.com Exchange API client — powered by CCXT.
+
+Replaces the hand-rolled HMAC-SHA256 wrapper with CCXT's battle-tested
+cryptocom connector. The public interface is identical to the original so
+all callers (grid_trader, regime_classifier, gemini_optimizer) need no changes.
+
+CCXT handles:
+  - HMAC-SHA256 request signing
+  - Automatic rate limiting (enableRateLimit=True)
+  - Retry-safe network error wrapping
+  - POST_ONLY limit order flag
 """
 
-import hashlib
-import hmac
-import json
 import os
-import time
 from typing import Any
 
-import httpx
+import ccxt
 
-CDX_BASE = "https://api.crypto.com/exchange/v1"
-CDX_TIMEOUT = 10  # seconds
+CDX_TIMEOUT = 10_000  # CCXT uses milliseconds
+
+_TIMEFRAME_MAP = {
+    "1D": "1d", "4h": "4h", "1h": "1h",
+    "30m": "30m", "15m": "15m", "5m": "5m", "1m": "1m",
+}
 
 
 class CDXError(Exception):
-    """Raised when the crypto.com API returns a non-zero code."""
+    """Raised when the crypto.com API returns an error."""
     pass
 
 
 class CDXClient:
     def __init__(self):
-        self.api_key = os.environ["CDX_API_KEY"]
-        self.secret  = os.environ["CDX_API_SECRET"]
-        self.client  = httpx.Client(timeout=CDX_TIMEOUT)
+        self._ex = ccxt.cryptocom({
+            "apiKey":          os.environ["CDX_API_KEY"],
+            "secret":          os.environ["CDX_API_SECRET"],
+            "timeout":         CDX_TIMEOUT,
+            "enableRateLimit": True,
+        })
 
     # ------------------------------------------------------------------ #
-    #  Auth helpers                                                         #
+    #  Internal helpers                                                    #
     # ------------------------------------------------------------------ #
 
-    def _sign(self, method: str, req_id: int, params: dict, nonce: str) -> str:
+    @staticmethod
+    def _sym(instrument: str) -> str:
+        """Convert BTC_USDT → BTC/USDT (CCXT unified symbol format)."""
+        return instrument.replace("_", "/")
+
+    def _call(self, fn, *args, **kwargs) -> Any:
+        """Wrap every CCXT call and convert library exceptions to CDXError."""
+        try:
+            return fn(*args, **kwargs)
+        except ccxt.NetworkError as e:
+            raise CDXError(f"Network error: {e}") from e
+        except ccxt.RateLimitExceeded as e:
+            raise CDXError(f"Rate limited: {e}") from e
+        except ccxt.ExchangeError as e:
+            raise CDXError(f"Exchange error: {e}") from e
+
+    @staticmethod
+    def _norm_order(o: dict) -> dict:
         """
-        crypto.com v1 signature:
-          sig_payload = method + id + api_key + params_string + nonce
-          sig         = HMAC-SHA256(sig_payload, secret).hexdigest()
+        Normalise a CCXT order dict to the format expected by grid_trader.py.
 
-        params_string: sort params by key, concatenate key+value recursively.
-        Nested dicts are flattened key-by-key; lists are joined as-is.
+        CCXT status → grid_trader expectation:
+          'closed'   → 'FILLED'
+          'open'     → 'ACTIVE'
+          'canceled' → 'CANCELED'
         """
-        def flatten(d: dict) -> str:
-            out = ""
-            for k in sorted(d.keys()):
-                v = d[k]
-                if isinstance(v, dict):
-                    out += k + flatten(v)
-                elif isinstance(v, list):
-                    out += k + "".join(str(i) for i in v)
-                else:
-                    out += k + str(v)
-            return out
-
-        param_str   = flatten(params) if params else ""
-        sig_payload = f"{method}{req_id}{self.api_key}{param_str}{nonce}"
-        return hmac.new(
-            self.secret.encode("utf-8"),
-            sig_payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-
-    def _post(self, method: str, params: dict | None = None) -> dict:
-        """Sign and POST a private request. Returns the result dict."""
-        params  = params or {}
-        nonce   = str(int(time.time() * 1000))
-        req_id  = int(nonce)
-        payload = {
-            "id":      req_id,
-            "method":  method,
-            "api_key": self.api_key,
-            "params":  params,
-            "nonce":   nonce,
-            "sig":     self._sign(method, req_id, params, nonce),
+        status_map = {
+            "closed":    "FILLED",
+            "open":      "ACTIVE",
+            "canceled":  "CANCELED",
+            "cancelled": "CANCELED",
+            "expired":   "EXPIRED",
+            "rejected":  "REJECTED",
         }
-        resp = self.client.post(f"{CDX_BASE}/{method}", json=payload)
-        if resp.status_code == 429:
-            raise CDXError("Rate limited (HTTP 429) — back off")
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("code", 0) != 0:
-            raise CDXError(f"API error {body.get('code')}: {body.get('message', body)}")
-        return body.get("result", {})
-
-    def _get_public(self, endpoint: str, params: dict | None = None) -> dict:
-        """GET a public endpoint (no auth required)."""
-        resp = self.client.get(f"{CDX_BASE}/{endpoint}", params=params or {})
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("code", 0) != 0:
-            raise CDXError(f"API error {body.get('code')}: {body.get('message', body)}")
-        return body.get("result", {})
+        fee = o.get("fee") or {}
+        return {
+            "order_id":            str(o.get("id", "")),
+            "status":              status_map.get(o.get("status", ""), (o.get("status") or "").upper()),
+            "side":                (o.get("side") or "").upper(),
+            "avg_price":           float(o.get("average") or o.get("price") or 0),
+            "cumulative_quantity": float(o.get("filled") or 0),
+            "cumulative_fee":      float(fee.get("cost") or 0),
+            "instrument_name":     (o.get("symbol") or "").replace("/", "_"),
+            "price":               float(o.get("price") or 0),
+            "quantity":            float(o.get("amount") or 0),
+        }
 
     # ------------------------------------------------------------------ #
-    #  Account                                                              #
+    #  Account                                                             #
     # ------------------------------------------------------------------ #
 
     def get_balance(self, currency: str = "USDT") -> float:
-        """Return the available balance for a given currency."""
-        result = self._post("private/get-account-summary", {"currency": currency})
-        for account in result.get("accounts", []):
-            if account.get("currency") == currency:
-                return float(account.get("available", 0))
-        return 0.0
+        """Return available balance for a given currency."""
+        result = self._call(self._ex.fetch_balance)
+        return float((result.get(currency) or {}).get("free") or 0)
 
     # ------------------------------------------------------------------ #
-    #  Market data                                                          #
+    #  Market data                                                         #
     # ------------------------------------------------------------------ #
 
     def get_ticker(self, instrument: str = "BTC_USDT") -> dict:
         """Return the latest ticker for an instrument."""
-        result = self._get_public("public/get-ticker", {"instrument_name": instrument})
-        data   = result.get("data", {})
+        t = self._call(self._ex.fetch_ticker, self._sym(instrument))
         return {
-            "price":    float(data.get("a", 0)),   # last traded price
-            "bid":      float(data.get("b", 0)),
-            "ask":      float(data.get("k", 0)),
-            "high_24h": float(data.get("h", 0)),
-            "low_24h":  float(data.get("l", 0)),
-            "volume":   float(data.get("v", 0)),
+            "price":    float(t.get("last") or t.get("close") or 0),
+            "bid":      float(t.get("bid") or 0),
+            "ask":      float(t.get("ask") or 0),
+            "high_24h": float(t.get("high") or 0),
+            "low_24h":  float(t.get("low") or 0),
+            "volume":   float(t.get("baseVolume") or 0),
         }
 
     def get_candlesticks(
         self,
         instrument: str = "BTC_USDT",
-        timeframe: str  = "1D",
-        count:     int  = 30,
+        timeframe:  str = "1D",
+        count:      int = 30,
     ) -> list[dict]:
         """
         Return OHLCV candles for regime classification.
         timeframe: 1m, 5m, 15m, 30m, 1h, 4h, 1D
         """
-        result  = self._get_public(
-            "public/get-candlestick",
-            {"instrument_name": instrument, "timeframe": timeframe, "count": count},
-        )
-        candles = result.get("data", [])
+        tf    = _TIMEFRAME_MAP.get(timeframe, timeframe.lower())
+        ohlcv = self._call(self._ex.fetch_ohlcv, self._sym(instrument), tf, limit=count)
         return [
             {
-                "ts":     c["t"],
-                "open":   float(c["o"]),
-                "high":   float(c["h"]),
-                "low":    float(c["l"]),
-                "close":  float(c["c"]),
-                "volume": float(c["v"]),
+                "ts":     int(c[0]),
+                "open":   float(c[1]),
+                "high":   float(c[2]),
+                "low":    float(c[3]),
+                "close":  float(c[4]),
+                "volume": float(c[5]),
             }
-            for c in candles
+            for c in ohlcv
         ]
 
     # ------------------------------------------------------------------ #
-    #  Orders                                                               #
+    #  Orders                                                              #
     # ------------------------------------------------------------------ #
 
     def place_limit_order(
         self,
         instrument: str,
-        side:       str,    # BUY or SELL
+        side:       str,
         price:      float,
         quantity:   float,
     ) -> str:
-        """Place a GTC limit order. Returns the order ID."""
-        result = self._post(
-            "private/create-order",
-            {
-                "instrument_name": instrument,
-                "side":            side.upper(),
-                "type":            "LIMIT",
-                "price":           f"{price:.2f}",
-                "quantity":        f"{quantity:.6f}",
-                "time_in_force":   "GOOD_TILL_CANCEL",
-                "exec_inst":       ["POST_ONLY"],   # maker only — saves fees
-            },
+        """Place a POST_ONLY GTC limit order. Returns the order ID."""
+        order = self._call(
+            self._ex.create_order,
+            self._sym(instrument),
+            "limit",
+            side.lower(),
+            quantity,
+            price,
+            {"postOnly": True, "time_in_force": "GTC"},
         )
-        order_id = result.get("order_id", "").strip()
+        order_id = str(order.get("id") or "").strip()
         if not order_id:
             raise CDXError("API accepted order but returned no order_id")
         return order_id
 
     def cancel_order(self, instrument: str, order_id: str) -> None:
         """Cancel a single order by ID."""
-        self._post(
-            "private/cancel-order",
-            {"instrument_name": instrument, "order_id": order_id},
-        )
+        self._call(self._ex.cancel_order, order_id, self._sym(instrument))
 
     def cancel_all_orders(self, instrument: str) -> None:
         """Cancel every open order for an instrument (kill switch use)."""
-        self._post(
-            "private/cancel-all-orders",
-            {"instrument_name": instrument},
-        )
+        try:
+            self._call(self._ex.cancel_all_orders, self._sym(instrument))
+        except CDXError:
+            # Fallback: cancel open orders one by one
+            open_orders = self._call(self._ex.fetch_open_orders, self._sym(instrument))
+            for o in open_orders:
+                try:
+                    self._call(self._ex.cancel_order, str(o["id"]), self._sym(instrument))
+                except Exception:
+                    pass
 
     def get_open_orders(self, instrument: str) -> list[dict]:
         """Return all currently open orders for an instrument."""
-        result = self._post(
-            "private/get-open-orders",
-            {"instrument_name": instrument},
-        )
-        return result.get("order_list", [])
+        orders = self._call(self._ex.fetch_open_orders, self._sym(instrument))
+        return [self._norm_order(o) for o in orders]
 
     def get_order_history(self, instrument: str, limit: int = 20) -> list[dict]:
         """Return recent order history (filled and cancelled)."""
-        result = self._post(
-            "private/get-order-history",
-            {"instrument_name": instrument, "page_size": limit},
-        )
-        return result.get("order_list", [])
+        try:
+            orders = self._call(
+                self._ex.fetch_closed_orders, self._sym(instrument), limit=limit
+            )
+        except CDXError:
+            orders = self._call(
+                self._ex.fetch_orders, self._sym(instrument), limit=limit
+            )
+        return [self._norm_order(o) for o in orders]

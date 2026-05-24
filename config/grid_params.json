@@ -2,7 +2,7 @@
   "instrument":    "BTC_USDT",
   "spacing_pct":   0.8,
   "range_pct":     5.0,
-  "levels":        10,
+  "levels":        6,
   "capital_pct":   0.70,
   "total_capital": 150,
   "gbp_usd_rate":  1.27,
