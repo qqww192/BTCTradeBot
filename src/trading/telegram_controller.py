@@ -108,7 +108,7 @@ def _build_status() -> str:
         f"💼 Portfolio: £{cap:.2f}" if cap else "",
         f"",
         f"⚙️ Grid config:",
-        f"  Regime: {regime.get('regime', 'unknown')} "
+        f"  Regime: {regime.get('regime', 'unknown').replace('_', '-')} "
         f"(HMM conf={regime.get('hmm_confidence', 0):.2f})",
         f"  Spacing: {cfg.get('spacing_pct', '?')}% · "
         f"Levels: {cfg.get('levels', '?')} · "
