@@ -753,6 +753,10 @@ def _check_stale_heartbeat() -> None:
             )
             print(f"[grid] {msg}")
             _send_telegram_alert(msg)
+            # Stamp the heartbeat now so this alert only fires once, even if the
+            # run exits early (kill switch, price fetch failure, pause flags, etc.).
+            hb["ts"] = datetime.now(timezone.utc).isoformat()
+            HEARTBEAT_FILE.write_text(json.dumps(hb))
     except Exception:
         pass
 
