@@ -13,8 +13,8 @@ PYTHONPATH={BOT_DIR}
 # ── Load .env before every run ──────────────────────────────────────
 # We source the .env inline so secrets are never written to the crontab.
 
-# ── Every 5 min: fill check + kill switch ──────────────────────────
-*/5 * * * * cd {BOT_DIR} && set -a && source .env && set +a && timeout 240s {PYTHON} src/trading/grid_trader.py >> {LOG_DIR}/grid_trader.log 2>&1
+# ── Every 2 min: fill check + kill switch ──────────────────────────
+*/2 * * * * cd {BOT_DIR} && set -a && source .env && set +a && timeout 90s {PYTHON} src/trading/grid_trader.py >> {LOG_DIR}/grid_trader.log 2>&1
 
 # ── Every 4 hours: regime classification (HMM + rule-based fallback) ─
 0 */4 * * * cd {BOT_DIR} && set -a && source .env && set +a && {PYTHON} src/trading/regime_classifier.py >> {LOG_DIR}/regime.log 2>&1
