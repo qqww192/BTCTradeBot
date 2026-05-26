@@ -89,7 +89,7 @@ for i in range(levels):
 | `src/trading/gemini_optimizer.py` | Sunday AI review (Groq/Cerebras); updates `config/grid_params.json` |
 | `src/trading/optuna_optimizer.py` | Saturday Optuna Bayesian sweep; writes `data/optuna_candidates.json` |
 | `src/trading/ai_advisor.py` | Per-run AI trade advice (10s timeout, protects cron window) |
-| `src/trading/news_sentiment.py` | Cached BTC news sentiment (FreeCryptoAPI); read by the 1-min loop |
+| `src/trading/news_sentiment.py` | Cached BTC news sentiment (Fear&Greed + cryptocurrency.cv + RSS, keyless); read by the 1-min loop |
 | `src/trading/telegram_controller.py` | Interactive Telegram controller (persistent async process) |
 | `src/trading/daily_reporter.py` | 08:00 UTC Telegram report |
 | `src/trading/trade_logger.py` | Append-only JSON fill ledger |
