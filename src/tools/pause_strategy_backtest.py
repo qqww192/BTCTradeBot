@@ -1,5 +1,5 @@
 """
-Backtest: compare three order-management strategies during trend pauses.
+Backtest: compare four order-management strategies during trend pauses.
 
 Uses 90 days of 4h BTC/USDT candles from Binance (public endpoint, no auth)
 if available; otherwise falls back to a scenario-based simulation seeded with
@@ -10,6 +10,8 @@ Strategies compared:
   A  keep-all        — leave all 6 grid orders open during pause (current)
   B  cancel-danger   — cancel BUY orders on trending_dn, cancel SELL on trending_up
   C  cancel-all      — cancel everything the moment pause fires
+  D  trailing-stop   — same as B but sells all held BTC if price drops TRAIL_PCT%
+                       from the intra-pause peak (trending_up only; = B on dn-trend)
 
 Grid assumptions (matching live config):
   - 6 levels, 1.0% spacing
@@ -35,6 +37,7 @@ sys.path.insert(0, str(ROOT / "src"))
 SPACING_PCT      = 0.01    # 1% grid spacing
 LEVELS_EACH_SIDE = 3       # 3 buy + 3 sell orders
 MAKER_FEE        = 0.0025  # 0.25% per fill
+TRAIL_PCT        = 3.0     # Strategy D: trailing stop fires if price drops 3% from peak
 
 
 # ------------------------------------------------------------------ #
@@ -304,6 +307,28 @@ def simulate_event(event: dict) -> dict:
     # Strategy C: cancel all
     pnl_c = 0.0
 
+    # Strategy D: trailing stop (trending_up only; identical to B on dn-trend)
+    # The trailing stop fires when price drops TRAIL_PCT% from the intra-pause peak.
+    # We know P_high (the highest price reached during the pause). If the resume
+    # price P_end is below P_high * (1 - TRAIL_PCT/100), the stop must have fired;
+    # we sell at P_trail instead of sitting through to P_end. An extra MAKER_FEE
+    # is charged for the stop-limit sell. If P_end >= P_trail the stop never fired
+    # and Strategy D equals Strategy B.
+    if regime == "trending_up":
+        P_trail = P_high * (1 - TRAIL_PCT / 100)
+        stop_fired = P_end < P_trail
+        if stop_fired:
+            # Sell all filled buys at the trailing-stop price
+            pnl_d = sum(
+                (P_trail - p) / P0 - 2 * MAKER_FEE   # extra fee for the stop sell
+                for p in filled_buys
+            )
+        else:
+            # Stop never triggered — same result as Strategy B
+            pnl_d = pnl_b
+    else:
+        pnl_d = pnl_b   # no trailing stop logic for downtrends
+
     return {
         "regime":        regime,
         "move_pct":      (P_end - P0) / P0 * 100,
@@ -314,6 +339,8 @@ def simulate_event(event: dict) -> dict:
         "pnl_a_pct":     pnl_a * 100,
         "pnl_b_pct":     pnl_b * 100,
         "pnl_c_pct":     pnl_c * 100,
+        "pnl_d_pct":     pnl_d * 100,
+        "trail_fired":   regime == "trending_up" and P_end < P_high * (1 - TRAIL_PCT / 100),
         "source":        event.get("source", ""),
     }
 
@@ -323,75 +350,88 @@ def simulate_event(event: dict) -> dict:
 # ------------------------------------------------------------------ #
 
 def print_report(results: list[dict], data_source: str) -> None:
-    print(f"\n{'='*80}")
+    print(f"\n{'='*90}")
     print(f"TREND PAUSE STRATEGY BACKTEST  ({data_source})")
-    print(f"{'='*80}")
-    print(f"\n{'Strategy legend':}")
-    print(f"  A keep-all      : all 6 grid orders left open during pause (current behaviour)")
-    print(f"  B cancel-danger : cancel BUY orders on trending_dn, cancel SELL on trending_up")
+    print(f"{'='*90}")
+    print(f"\nStrategy legend:")
+    print(f"  A keep-all      : all 6 grid orders left open during pause")
+    print(f"  B cancel-danger : cancel BUY orders on trending_dn, cancel SELL on trending_up  ← LIVE")
     print(f"  C cancel-all    : cancel all orders immediately on pause")
+    print(f"  D trailing-stop : same as B but sell all BTC if price drops {TRAIL_PCT:.0f}% from peak (up-trend only)")
     print(f"\nGrid: {LEVELS_EACH_SIDE} buy + {LEVELS_EACH_SIDE} sell levels, "
           f"{SPACING_PCT*100:.1f}% spacing, {MAKER_FEE*100:.2f}% maker fee per fill.\n")
 
     hdr = (f"{'#':>3}  {'Regime':>12}  {'Move%':>7}  {'Bars':>4}  "
-           f"{'Buys':>4}  {'Sells':>5}  {'A%':>7}  {'B%':>7}  {'C%':>6}  Note")
+           f"{'Buys':>4}  {'Sells':>5}  {'A%':>7}  {'B%':>7}  {'C%':>6}  {'D%':>7}  {'D-stop':>6}  Note")
     print(hdr)
-    print("-" * 95)
+    print("-" * 110)
     for i, r in enumerate(results, 1):
+        stop_flag = "FIRED" if r.get("trail_fired") else ("—" if r["regime"] == "trending_up" else "n/a")
         print(
             f"{i:>3}  {r['regime']:>12}  {r['move_pct']:>+7.2f}  {r['n_candles']:>4}  "
             f"{r['filled_buys']:>4}  {r['filled_sells']:>5}  "
             f"{r['pnl_a_pct']:>+7.3f}  {r['pnl_b_pct']:>+7.3f}  {r['pnl_c_pct']:>+6.3f}  "
-            f"{r.get('note','')}"
+            f"{r['pnl_d_pct']:>+7.3f}  {stop_flag:>6}  {r.get('note','')}"
         )
 
     n = len(results)
     ta = sum(r["pnl_a_pct"] for r in results)
     tb = sum(r["pnl_b_pct"] for r in results)
     tc = sum(r["pnl_c_pct"] for r in results)
+    td = sum(r["pnl_d_pct"] for r in results)
 
     dn_r = [r for r in results if r["regime"] == "trending_dn"]
     up_r = [r for r in results if r["regime"] == "trending_up"]
 
-    print("-" * 95)
+    print("-" * 110)
     print(f"\n{'Events':>10}: {n}  ({len(dn_r)} dn / {len(up_r)} up)")
-    print(f"{'TOTAL':>10}:  A={ta:>+8.3f}%   B={tb:>+8.3f}%   C={tc:>+8.3f}%")
-    print(f"{'PER EVENT':>10}:  A={ta/n:>+8.3f}%   B={tb/n:>+8.3f}%   C={tc/n:>+8.3f}%")
+    print(f"{'TOTAL':>10}:  A={ta:>+8.3f}%   B={tb:>+8.3f}%   C={tc:>+8.3f}%   D={td:>+8.3f}%")
+    print(f"{'PER EVENT':>10}:  A={ta/n:>+8.3f}%   B={tb/n:>+8.3f}%   C={tc/n:>+8.3f}%   D={td/n:>+8.3f}%")
 
     if dn_r:
         da = sum(r["pnl_a_pct"] for r in dn_r)
         db = sum(r["pnl_b_pct"] for r in dn_r)
         dc = sum(r["pnl_c_pct"] for r in dn_r)
-        print(f"\n  trending_dn ({len(dn_r)} events):  A={da:>+8.3f}%  B={db:>+8.3f}%  C={dc:>+8.3f}%")
-        dn_best = "A" if da >= db and da >= dc else ("B" if db >= dc else "C")
-        print(f"    → Best for downtrends:  Strategy {dn_best}")
+        dd = sum(r["pnl_d_pct"] for r in dn_r)
+        print(f"\n  trending_dn ({len(dn_r)} events):  A={da:>+8.3f}%  B={db:>+8.3f}%  C={dc:>+8.3f}%  D={dd:>+8.3f}%")
+        vals = {"A": da, "B": db, "C": dc, "D": dd}
+        print(f"    → Best for downtrends:  Strategy {max(vals, key=vals.get)}")
 
     if up_r:
         ua = sum(r["pnl_a_pct"] for r in up_r)
         ub = sum(r["pnl_b_pct"] for r in up_r)
         uc = sum(r["pnl_c_pct"] for r in up_r)
-        print(f"\n  trending_up ({len(up_r)} events):  A={ua:>+8.3f}%  B={ub:>+8.3f}%  C={uc:>+8.3f}%")
-        up_best = "A" if ua >= ub and ua >= uc else ("B" if ub >= uc else "C")
-        print(f"    → Best for uptrends:  Strategy {up_best}")
+        ud = sum(r["pnl_d_pct"] for r in up_r)
+        fires = sum(1 for r in up_r if r.get("trail_fired"))
+        print(f"\n  trending_up ({len(up_r)} events):  A={ua:>+8.3f}%  B={ub:>+8.3f}%  C={uc:>+8.3f}%  D={ud:>+8.3f}%")
+        vals = {"A": ua, "B": ub, "C": uc, "D": ud}
+        print(f"    → Best for uptrends:  Strategy {max(vals, key=vals.get)}")
+        print(f"    → Trailing stop fired in {fires}/{len(up_r)} uptrend events ({fires/len(up_r)*100:.0f}%)")
+        if fires:
+            avg_b = ub / len(up_r)
+            avg_d = ud / len(up_r)
+            print(f"    → D vs B per uptrend event: {avg_d - avg_b:>+.3f}% "
+                  f"({'better' if avg_d > avg_b else 'worse'} with trailing stop)")
 
-    winners = {"A keep-all": ta, "B cancel-dangerous": tb, "C cancel-all": tc}
+    winners = {"A keep-all": ta, "B cancel-dangerous": tb, "C cancel-all": tc, f"D trail-{TRAIL_PCT:.0f}pct": td}
     best    = max(winners, key=winners.get)
     print(f"\n{'★ OVERALL WINNER':>18}: {best}  ({winners[best]:+.3f}%)")
 
-    # Qualitative interpretation
-    print(f"\n{'─'*80}")
-    print("Interpretation:")
-    if best.startswith("A"):
-        print("  keep-all wins: grid orders on both sides capture value even during trends.")
-        print("  Sell orders above fill profitably in uptrends; buy orders below can fill on")
-        print("  temporary bounces in downtrends. Fee savings from NOT cancelling add up.")
-    elif best.startswith("B"):
-        print("  cancel-dangerous wins: eliminating the directional risk outweighs the")
-        print("  missed fills. In downtrends, every buy order that fills is a loss; in")
-        print("  uptrends, every sell order that fills exits BTC too early.")
-    else:
-        print("  cancel-all wins: the opportunity cost of letting any orders fill during")
-        print("  a confirmed trend exceeds the value of any remaining fills.")
+    # Uptrend verdict (most actionable for the trailing-stop question)
+    if up_r:
+        up_vals = {"A": ua, "B": ub, "C": uc, "D": ud}  # type: ignore[possibly-undefined]
+        up_best = max(up_vals, key=up_vals.get)
+        d_beats_b = ud > ub  # type: ignore[possibly-undefined]
+        print(f"\n{'─'*90}")
+        print(f"Uptrend verdict (key question — trailing stop vs passive hold):")
+        if d_beats_b:
+            margin = (ud - ub) / len(up_r)  # type: ignore[possibly-undefined]
+            print(f"  ✅  Strategy D beats B by {margin:+.3f}% per uptrend event.")
+            print(f"  Recommendation: implement {TRAIL_PCT:.0f}% trailing stop on trending_up pauses.")
+        else:
+            margin = (ub - ud) / len(up_r)  # type: ignore[possibly-undefined]
+            print(f"  ❌  Strategy B (passive hold) beats D by {margin:+.3f}% per uptrend event.")
+            print(f"  Recommendation: keep current passive-hold behaviour; trailing stop cuts gains early.")
     print()
 
 

@@ -33,7 +33,7 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -70,7 +70,9 @@ RECENTER_FLAG   = ROOT / "data"   / "force_recenter.flag" # Telegram controller
 TREND_PAUSE_FLAG = ROOT / "data"  / "trend_pause.flag"   # regime_classifier: strong trend detected
 PROM_DIR        = ROOT / "data"   / "prometheus"
 
-RECENTER_CONFIRM_MINUTES = 20  # force recenter if AI keeps saying HOLD past this
+RECENTER_CONFIRM_MINUTES    = 20   # force recenter if AI keeps saying HOLD past this
+TRAIL_STOP_PCT              = 3.0  # Strategy D: trailing stop fires if BTC drops this % from pause peak
+PAUSE_STATUS_INTERVAL_MIN   = 30   # send a Telegram status update at most once per N minutes while paused
 
 SAFE_BOUNDS = {
     "spacing_pct": (0.55, 3.0),
@@ -795,7 +797,21 @@ def needs_recalibration(current_price: float, grid_state: dict, config: dict) ->
     # range_pct is the regime-aware recenter threshold — tight in volatile markets,
     # wider in trending ones so the bot doesn't churn the grid on every swing.
     threshold  = config.get("range_pct", 5.0)
-    return move_pct > threshold
+    if move_pct > threshold:
+        return True
+    # After a trend pause, Strategy B cancels one side of the grid. On resume the
+    # remaining orders are misaligned — sells placed at old calibration levels are
+    # below the current bid and skipped by the POST_ONLY guard, leaving the grid
+    # half-functional. Use a lower threshold (2%) so we recenter promptly when
+    # the grid has orders on only one side.
+    levels    = grid_state.get("levels", {})
+    live      = [v for v in levels.values() if v.get("order_id")]
+    has_buys  = any(v.get("side") == "BUY"  for v in live)
+    has_sells = any(v.get("side") == "SELL" for v in live)
+    one_sided = bool(live) and (not has_buys or not has_sells)
+    if one_sided and move_pct >= 2.0:
+        return True
+    return False
 
 
 def cancel_all_and_clear(cdx: CDXClient, grid_state: dict) -> bool:
@@ -821,7 +837,9 @@ def cancel_all_and_clear(cdx: CDXClient, grid_state: dict) -> bool:
     return True
 
 
-def _handle_trend_pause_orders(regime: str) -> None:
+def _handle_trend_pause_orders(
+    cdx: CDXClient, grid_state: dict, regime: str
+) -> None:
     """
     Cancel the dangerous-direction orders when a trend pause is active.
 
@@ -830,27 +848,26 @@ def _handle_trend_pause_orders(regime: str) -> None:
 
     Idempotent: fetches live open orders each call, so repeated calls during a
     multi-minute pause safely no-op once the relevant side is already gone.
+    Mutates grid_state in place; caller is responsible for saving it.
     """
     if regime not in ("trending_dn", "trending_up"):
         return
 
-    dangerous_side = "BUY" if regime == "trending_dn" else "SELL"
+    dangerous_side  = "BUY" if regime == "trending_dn" else "SELL"
     direction_label = "down" if regime == "trending_dn" else "up"
 
     try:
-        cdx = CDXClient()
         open_orders = cdx.get_open_orders(INSTRUMENT)
     except Exception as e:
         print(f"[grid] trend-pause cancel: could not fetch open orders: {e}")
         return
 
-    to_cancel = [o for o in open_orders if o.get("side") == dangerous_side]
+    to_cancel  = [o for o in open_orders if o.get("side") == dangerous_side]
     if not to_cancel:
         return
 
-    grid_state  = load_grid_state()
-    cancel_ids  = {o["order_id"] for o in to_cancel}
-    failed      = []
+    cancel_ids = {o["order_id"] for o in to_cancel}
+    failed     = []
 
     for o in to_cancel:
         try:
@@ -859,12 +876,10 @@ def _handle_trend_pause_orders(regime: str) -> None:
             print(f"[grid] trend-pause: failed to cancel {o['order_id']}: {e}")
             failed.append(o["order_id"])
 
-    # Remove successfully cancelled orders from grid state
     grid_state["levels"] = {
         k: v for k, v in grid_state["levels"].items()
         if v.get("order_id") not in (cancel_ids - set(failed))
     }
-    save_grid_state(grid_state)
 
     cancelled_count = len(to_cancel) - len(failed)
     msg = (
@@ -874,6 +889,154 @@ def _handle_trend_pause_orders(regime: str) -> None:
     if failed:
         msg += f"\n⚠️ {len(failed)} order(s) could not be cancelled — check exchange."
     print(f"[grid] {msg}")
+    _send_telegram_alert(msg)
+
+
+def _check_trailing_stop(
+    cdx: CDXClient, grid_state: dict, price: float, best_bid: float
+) -> None:
+    """
+    Strategy D trailing stop for trending_up pauses.
+
+    Tracks the rolling peak price seen since the pause started and sells all
+    free BTC via a POST_ONLY limit order if price drops TRAIL_STOP_PCT% from
+    that peak.  Idempotent — once trail_stop_fired is set in grid_state the
+    function no-ops on every subsequent tick.
+    Mutates grid_state in place; caller is responsible for saving it.
+    """
+    if grid_state.get("trail_stop_fired"):
+        return
+
+    # Update the rolling peak
+    prev_peak = grid_state.get("trend_peak_price", 0.0)
+    new_peak  = max(prev_peak, price)
+    grid_state["trend_peak_price"] = new_peak
+
+    trail_price = new_peak * (1 - TRAIL_STOP_PCT / 100)
+    if price >= trail_price:
+        return  # still above stop level — nothing to do
+
+    # ── Trailing stop fires ──────────────────────────────────────────────────
+    print(f"[grid] Trailing stop fired: price {price:,.2f} < stop {trail_price:,.2f} "
+          f"(peak {new_peak:,.2f} − {TRAIL_STOP_PCT}%)")
+
+    # 1. Cancel all remaining open orders so BTC is freed from locked buy orders
+    try:
+        cdx.cancel_all_orders(INSTRUMENT)
+        grid_state["levels"] = {}
+        print("[grid] Trailing stop: all open orders cancelled.")
+    except CDXError as e:
+        print(f"[grid] Trailing stop: cancel_all_orders failed: {e} — will still attempt sell")
+
+    # 2. Sell the free BTC balance at just above best_bid (POST_ONLY maker)
+    sell_price = round(best_bid * 1.0001, 2)  # 0.01% above bid — enters book immediately
+    order_id   = None
+    btc_qty    = 0.0
+    try:
+        btc_qty = cdx.get_balance("BTC")
+        if btc_qty >= MIN_QTY_BTC:
+            btc_qty   = round(btc_qty, 6)
+            order_id  = cdx.place_limit_order(INSTRUMENT, "SELL", sell_price, btc_qty)
+            print(f"[grid] Trailing stop sell placed: {btc_qty} BTC @ {sell_price:,.2f} "
+                  f"(order {order_id})")
+        else:
+            print(f"[grid] Trailing stop: BTC balance {btc_qty:.6f} below minimum — no sell placed")
+    except Exception as e:
+        print(f"[grid] Trailing stop sell failed: {e}")
+
+    # 3. Mark as fired so we don't retry every minute
+    grid_state["trail_stop_fired"] = True
+
+    # 4. Notify
+    gain_pct = (new_peak - grid_state.get("calibration_price", new_peak)) / max(grid_state.get("calibration_price", new_peak), 1) * 100
+    sell_line = (f"Placed sell: {btc_qty:.6f} BTC @ ${sell_price:,.2f}" if order_id
+                 else "⚠️ Sell order could not be placed — check exchange manually")
+    msg = (
+        f"🔴 *Trailing stop fired!*\n"
+        f"BTC dropped {TRAIL_STOP_PCT:.0f}% from peak: ${new_peak:,.0f} → ${price:,.0f}\n"
+        f"{sell_line}\n"
+        f"Grid standing by. Will resume automatically when trend weakens."
+    )
+    print(f"[grid] {msg}")
+    _send_telegram_alert(msg)
+
+
+def _send_pause_status(
+    grid_state: dict, regime_data: dict, price: float
+) -> None:
+    """
+    Send a Telegram status update at most once every PAUSE_STATUS_INTERVAL_MIN
+    minutes while the trend pause is active.  Shows current BTC vs peak,
+    trailing-stop level, and when the next regime check is expected.
+    Mutates grid_state in place (updates last_pause_status_ts); caller saves it.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Throttle: skip if we sent one recently
+    last_ts_str = grid_state.get("last_pause_status_ts")
+    if last_ts_str:
+        try:
+            elapsed_min = (now - datetime.fromisoformat(last_ts_str)).total_seconds() / 60
+            if elapsed_min < PAUSE_STATUS_INTERVAL_MIN:
+                return
+        except Exception:
+            pass
+
+    regime = regime_data.get("regime", "unknown")
+
+    # Next regime classifier run: updated_at + 4h
+    next_check_str = "unknown"
+    try:
+        updated_at = datetime.fromisoformat(regime_data.get("updated_at", ""))
+        next_check = updated_at + timedelta(hours=4)
+        mins_until  = max(0, (next_check - now).total_seconds() / 60)
+        if mins_until < 60:
+            next_check_str = f"~{mins_until:.0f} min"
+        else:
+            next_check_str = f"~{mins_until/60:.1f}h"
+    except Exception:
+        pass
+
+    if regime == "trending_up" and price > 0:
+        peak        = grid_state.get("trend_peak_price", price)
+        trail_price = peak * (1 - TRAIL_STOP_PCT / 100)
+        drop_pct    = (peak - price) / peak * 100
+        stop_gap    = (price - trail_price) / price * 100
+        fired       = grid_state.get("trail_stop_fired", False)
+
+        if fired:
+            status_line = "🔴 Trailing stop has fired — waiting for trend to clear"
+            action_line = "Grid will resume when the regime reverts to ranging."
+        else:
+            warn = " ⚠️ *Close!*" if stop_gap < 0.5 else ""
+            status_line = (
+                f"💰 BTC: ${price:,.0f} | 📈 Peak: ${peak:,.0f} | Drop from peak: {drop_pct:.1f}%\n"
+                f"🛑 Trailing stop: ${trail_price:,.0f} ({TRAIL_STOP_PCT:.0f}% below peak) "
+                f"— {stop_gap:.1f}% away{warn}"
+            )
+            action_line = (
+                f"If BTC drops to ${trail_price:,.0f} → trailing stop sells all BTC and bot stands by.\n"
+                f"If trend weakens → grid resumes automatically."
+            )
+
+        msg = (
+            f"⏸ *Trend pause — uptrend in progress*\n\n"
+            f"{status_line}\n\n"
+            f"⏰ Next regime check: {next_check_str}\n"
+            f"Next step: {action_line}"
+        )
+    elif regime == "trending_dn" and price > 0:
+        msg = (
+            f"⏸ *Trend pause — downtrend in progress*\n\n"
+            f"💰 BTC: ${price:,.0f} | Buy orders cancelled — protecting capital\n\n"
+            f"⏰ Next regime check: {next_check_str}\n"
+            f"Next step: Grid resumes automatically when downtrend weakens."
+        )
+    else:
+        return  # no price or unknown regime — skip
+
+    grid_state["last_pause_status_ts"] = now.isoformat()
+    print(f"[grid] Sending pause status update")
     _send_telegram_alert(msg)
 
 
@@ -964,7 +1127,31 @@ def _run() -> None:
     # to avoid directional risk. Idempotent — safe to call every minute.
     if TREND_PAUSE_FLAG.exists():
         regime_data = load_regime()
-        _handle_trend_pause_orders(regime_data.get("regime", ""))
+        regime_str  = regime_data.get("regime", "")
+        cdx         = CDXClient()
+        grid_state  = load_grid_state()
+
+        # Fetch price (needed for trailing stop and status message)
+        price_tp = best_bid_tp = 0.0
+        try:
+            book         = cdx.get_order_book(INSTRUMENT, depth=5)
+            price_tp     = book.get("mid_price") or book.get("best_bid") or 0.0
+            best_bid_tp  = book.get("best_bid") or 0.0
+        except Exception as e:
+            print(f"[grid] trend-pause: price fetch failed ({e}) — status skipped")
+
+        # Cancel dangerous-side orders (skipped once trail_stop_fired)
+        if not grid_state.get("trail_stop_fired"):
+            _handle_trend_pause_orders(cdx, grid_state, regime_str)
+
+        # Strategy D: trailing stop for uptrends
+        if regime_str == "trending_up" and price_tp > 0:
+            _check_trailing_stop(cdx, grid_state, price_tp, best_bid_tp)
+
+        # Periodic Telegram status (throttled to PAUSE_STATUS_INTERVAL_MIN)
+        _send_pause_status(grid_state, regime_data, price_tp)
+
+        save_grid_state(grid_state)
         print("[grid] Trend pause active — standing aside. Exiting.")
         return
 
@@ -977,6 +1164,14 @@ def _run() -> None:
 
     grid_state = load_grid_state()
     cdx        = CDXClient()
+
+    # Clear trailing-stop flags left over from a completed trend pause so they
+    # don't interfere with the next trending_up episode.
+    if grid_state.get("trail_stop_fired") or grid_state.get("trend_peak_price"):
+        grid_state.pop("trail_stop_fired",      None)
+        grid_state.pop("trend_peak_price",      None)
+        grid_state.pop("last_pause_status_ts",  None)
+        save_grid_state(grid_state)
 
     # 3. Refresh total_capital from live portfolio (replaces hardcoded £150)
     #    and snapshot live P&L to data/portfolio.json.
